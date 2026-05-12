@@ -1,0 +1,47 @@
+[project]
+name = "lorakit"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Nolla Fox",email = "nollafox.dev@gmail.com"}
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "pillow (>=12.2.0,<13.0.0)",
+    "huggingface-hub (>=0.34.0,<1.0)",
+    "diffusers[torch] (>=0.38.0,<0.39.0)",
+    "accelerate (>=1.13.0,<2.0.0)",
+    "datasets (>=4.8.5,<5.0.0)",
+    "transformers (>=4.57.0,<5.0.0)",
+    "peft (>=0.19.1,<0.20.0)",
+    "torchvision (>=0.26.0,<0.27.0)",
+    "numpy (>=2.4.4,<3.0.0)",
+    "tqdm (>=4.67.3,<5.0.0)",
+    "bitsandbytes (>=0.49.2,<0.50.0)"
+]
+
+[project.optional-dependencies]
+accel = [
+    "xformers (>=0.0.35,<0.0.36)"
+]
+
+[project.scripts]
+lorakit = "lorakit.cli:main"
+
+[tool.poetry]
+packages = [
+    {include = "lorakit", from = "src"}
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.3,<10.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
