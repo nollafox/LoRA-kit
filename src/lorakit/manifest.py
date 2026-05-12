@@ -77,7 +77,7 @@ def build_manifest_entry(
     metadata = load_metadata(metadata_path)
     if "tags" not in metadata:
         raise MissingMetadata(f"Metadata is missing required 'tags': {metadata_path}")
-    tags = normalize_tags(metadata["tags"], metadata_path)
+    tags = expand_underscore_tags(normalize_tags(metadata["tags"], metadata_path))
     if trigger:
         tags.insert(0, trigger)
 
@@ -101,6 +101,23 @@ def normalize_tags(tags_value: Any, metadata_path: Path) -> list[str]:
     raise MissingMetadata(
         f"Metadata 'tags' must be a list of strings or category mapping: {metadata_path}"
     )
+
+
+def expand_underscore_tags(tags: list[str]) -> list[str]:
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        _append_tag(expanded, seen, tag)
+        if "_" in tag:
+            _append_tag(expanded, seen, tag.replace("_", " "))
+    return expanded
+
+
+def _append_tag(tags: list[str], seen: set[str], tag: str) -> None:
+    if tag in seen:
+        return
+    tags.append(tag)
+    seen.add(tag)
 
 
 def _flatten_tag_categories(tags_by_category: dict[Any, Any], metadata_path: Path) -> list[str]:

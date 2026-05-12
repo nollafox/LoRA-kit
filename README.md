@@ -111,7 +111,7 @@ Every prepared dataset comes with a `lorakit-manifest.jsonl`. One image per line
 {"image": "images/IMG_1.png", "caption": "lorakit, anthro fox, male, solo, blue eyes", "tags": ["lorakit", "anthro fox", "male", "solo", "blue eyes"]}
 ```
 
-Each row carries two views of the same information. `caption` is the comma-joined tag string that training backends actually read; if you pass `--trigger`, the trigger word is prepended here. `tags` keeps the structured list so downstream tools can use it without re-parsing.
+Each row carries two views of the same information. `caption` is the comma-joined tag string that training backends actually read; if you pass `--trigger`, the trigger word is prepended here. `tags` keeps the structured list so downstream tools can use it without re-parsing. During prepare, underscore tags are kept and expanded with a space-separated companion, so `hi_res` becomes both `hi_res` and `hi res`.
 
 Different backends adapt cheaply. A Diffusers run, for instance, rewrites each row into `{"file_name": "...", "text": "..."}` on the way in.
 
@@ -256,6 +256,7 @@ That is the common case: train the staged dataset `fox-solo` against the base mo
 ```bash
 $ lorakit train fox-solo \
     --model sd15 \
+    --preset character \
     --backend diffusers \
     --resolution 512 \
     --rank 16 \
@@ -265,6 +266,23 @@ $ lorakit train fox-solo \
     --gradient-accumulation 4 \
     --mixed-precision fp16
 ```
+
+`--preset` fills in the training knobs for common LoRA goals. Presets are just defaults: pass `--rank`, `--steps`, `--learning-rate`, `--batch-size`, or `--gradient-accumulation` to override any individual value.
+
+| Preset | Use case | Rank | Steps | Learning rate |
+| --- | --- | ---: | ---: | ---: |
+| `concept` | Simple visual concepts: ears, markings, props, small objects, simple accessories. | 8 | 1200 | `1e-4` |
+| `clothing` | A specific garment or wearable item. | 16 | 2000 | `1e-4` |
+| `character` | Balanced character identity training. | 16 | 2200 | `1e-4` |
+| `style` | An artist, style, or aesthetic LoRA. | 32 | 2500 | `5e-5` |
+| `clothing-simple` | Hats, collars, simple shirts, glasses, simple jackets. | 8 | 1500 | `1e-4` |
+| `clothing-detailed` | Complex outfits, armor, uniforms, accessories, patterned garments. | 32 | 2800 | `5e-5` |
+| `character-lite` | Flexible character LoRAs that should not overfit too hard. | 8 | 1600 | `1e-4` |
+| `character-detail` | Detailed character identity, markings, outfit, and body features. | 16 | 2600 | `1e-4` |
+| `style-soft` | Promptable style influence that should not overpower images. | 16 | 2000 | `5e-5` |
+| `style-strong` | More faithful style capture. | 32 | 3000 | `5e-5` |
+
+All presets use `--batch-size 1` and `--gradient-accumulation 4`.
 
 `train` always runs `dataset prepare` first, so a single command goes from staged folder to trained LoRA. Any prepare flags you pass to `train` flow through to that step. Pass `--no-prepare` to skip preparation and reuse whatever is already in `prepared/<dataset>/`.
 
@@ -313,8 +331,8 @@ Two flags apply across the CLI:
 
 | Flag | Where | Description |
 | --- | --- | --- |
-| `--data-dir <path>` | Every command. | Overrides the default `./data` location. The model directory is the sibling `models/` folder beside the selected data directory. |
-| `--output text\|json\|jsonl` | Commands that print structured results. | Defaults to `text`. Destructive commands ignore it. |
+| `--data-dir <path>` | Every command. | Overrides the default `./data` location. You can put it before the command or on the command itself. The model directory is the sibling `models/` folder beside the selected data directory. |
+| `--output text\|json\|jsonl` | Commands that print structured results. | Defaults to `text`. You can put it before the command or on the command itself. Destructive commands ignore it. |
 
 There is no `lorakit init`. Commands auto-create any missing pieces of the data directory on first use.
 

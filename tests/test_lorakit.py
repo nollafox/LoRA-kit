@@ -177,6 +177,25 @@ def test_prepare_uses_staged_metadata_override(tmp_path):
     assert read_manifest(prepared / MANIFEST_NAME)[0]["caption"] == "override"
 
 
+def test_prepare_expands_underscore_tags_from_candidate_and_override_metadata(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "candidate", tags=["hi_res", "solo"])
+    _candidate(paths, "override", tags=["ignored"])
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "candidate")
+    project.datasets.stage("ds", "override")
+    _metadata(paths.staged_for("ds") / "override.json", tags=["blue_eyes", "blue eyes"])
+
+    prepared = project.datasets.prepare("ds", PrepareConfig(width=32, height=32))
+    rows = read_manifest(prepared / MANIFEST_NAME)
+
+    assert rows[0]["tags"] == ["hi_res", "hi res", "solo"]
+    assert rows[0]["caption"] == "hi_res, hi res, solo"
+    assert rows[1]["tags"] == ["blue_eyes", "blue eyes"]
+    assert rows[1]["caption"] == "blue_eyes, blue eyes"
+
+
 def test_prepare_flattens_six2one_tag_categories(tmp_path):
     paths = Paths(tmp_path / "data")
     paths.ensure()
@@ -205,7 +224,9 @@ def test_prepare_flattens_six2one_tag_categories(tmp_path):
         "solo",
         "fox",
         "artist_name",
+        "artist name",
         "hi_res",
+        "hi res",
     ]
 
 
@@ -531,6 +552,39 @@ def test_cli_create_list_json_and_error_paths(tmp_path, capsys):
     assert "Dataset already exists" in stderr
 
 
+def test_cli_accepts_data_dir_at_command_levels(tmp_path, capsys):
+    first = tmp_path / "first" / "data"
+    second = tmp_path / "second" / "data"
+    third = tmp_path / "third" / "data"
+
+    assert main(["dataset", "--data-dir", str(first), "create", "ds"]) == 0
+    assert (first / "staged" / "ds").exists()
+
+    assert main(["dataset", "create", "ds", "--data-dir", str(second)]) == 0
+    assert (second / "staged" / "ds").exists()
+
+    assert main(["dataset", "list", "--data-dir", str(third)]) == 0
+    assert "STAGED IMAGES" in capsys.readouterr().out
+    assert third.exists()
+
+
+def test_cli_import_extracts_trailing_data_dir_from_importer_args(tmp_path, monkeypatch):
+    data_dir = tmp_path / "import-data"
+
+    def fake_run(command, *, check):
+        out_dir = Path(command[-1])
+        _image(out_dir / "0001.png")
+        _six2one_metadata(out_dir / "0001.json", post_id=1)
+
+    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
+    monkeypatch.setattr(six2one.subprocess, "run", fake_run)
+
+    assert main(["candidates", "import", "621", "fox", "--data-dir", str(data_dir)]) == 0
+
+    assert (data_dir / "candidates" / "0001.png").exists()
+    assert (data_dir / "candidates" / "0001.json").exists()
+
+
 def test_cli_dataset_stage_all(tmp_path, capsys):
     data_dir = tmp_path / "data"
     paths = Paths(data_dir)
@@ -689,6 +743,52 @@ def test_cli_train_dry_run_prints_plan(tmp_path, capsys):
     assert code == 0
     assert payload["dry_run"] is True
     assert payload["plan"]["prepare_would_run"] is True
+
+
+def test_cli_train_preset_values_and_overrides(tmp_path, capsys):
+    data_dir = tmp_path / "data"
+    paths = Paths(data_dir)
+    _candidate(paths, "0001")
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "0001")
+    (paths.models / "sd15.safetensors").write_bytes(b"model")
+
+    code = main(
+        [
+            "--data-dir",
+            str(data_dir),
+            "--output",
+            "json",
+            "train",
+            "ds",
+            "--preset",
+            "style-soft",
+            "--steps",
+            "2400",
+            "--dry-run",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["plan"]["train_config"]["rank"] == 16
+    assert payload["plan"]["train_config"]["steps"] == 2400
+    assert payload["plan"]["train_config"]["learning_rate"] == 5e-5
+    assert payload["plan"]["train_config"]["batch_size"] == 1
+    assert payload["plan"]["train_config"]["gradient_accumulation"] == 4
+
+
+def test_cli_train_help_lists_presets(capsys):
+    with pytest.raises(SystemExit) as error:
+        main(["train", "--help"])
+    output = capsys.readouterr().out
+
+    assert error.value.code == 0
+    assert "--preset" in output
+    assert "concept" in output
+    assert "style-strong" in output
+    assert "individual train flags still override" in output
 
 
 def test_cli_size_cannot_be_combined_with_width(tmp_path, capsys):

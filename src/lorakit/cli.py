@@ -3,7 +3,7 @@
 import argparse
 import json
 import sys
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,87 @@ from lorakit.types import (
 
 
 DEFAULT_PREPARE_SIZE = 512
+DEFAULT_DATA_DIR = "./data"
+DEFAULT_OUTPUT = "text"
+DEFAULT_RANK = 16
+DEFAULT_STEPS = 2000
+DEFAULT_LEARNING_RATE = 1e-4
+DEFAULT_BATCH_SIZE = 1
+DEFAULT_GRADIENT_ACCUMULATION = 4
+
+
+@dataclass(frozen=True)
+class TrainPreset:
+    description: str
+    rank: int
+    steps: int
+    learning_rate: float
+    batch_size: int = DEFAULT_BATCH_SIZE
+    gradient_accumulation: int = DEFAULT_GRADIENT_ACCUMULATION
+
+
+TRAIN_PRESETS = {
+    "concept": TrainPreset(
+        description="simple visual concepts: ears, markings, props, small objects",
+        rank=8,
+        steps=1200,
+        learning_rate=1e-4,
+    ),
+    "clothing": TrainPreset(
+        description="a specific garment or wearable item",
+        rank=16,
+        steps=2000,
+        learning_rate=1e-4,
+    ),
+    "character": TrainPreset(
+        description="balanced character identity training",
+        rank=16,
+        steps=2200,
+        learning_rate=1e-4,
+    ),
+    "style": TrainPreset(
+        description="an artist, style, or aesthetic LoRA",
+        rank=32,
+        steps=2500,
+        learning_rate=5e-5,
+    ),
+    "clothing-simple": TrainPreset(
+        description="hats, collars, simple shirts, glasses, simple jackets",
+        rank=8,
+        steps=1500,
+        learning_rate=1e-4,
+    ),
+    "clothing-detailed": TrainPreset(
+        description="complex outfits, armor, uniforms, accessories, patterns",
+        rank=32,
+        steps=2800,
+        learning_rate=5e-5,
+    ),
+    "character-lite": TrainPreset(
+        description="flexible character LoRAs that should not overfit too hard",
+        rank=8,
+        steps=1600,
+        learning_rate=1e-4,
+    ),
+    "character-detail": TrainPreset(
+        description="detailed identity, markings, outfit, and body features",
+        rank=16,
+        steps=2600,
+        learning_rate=1e-4,
+    ),
+    "style-soft": TrainPreset(
+        description="promptable style influence that should not overpower images",
+        rank=16,
+        steps=2000,
+        learning_rate=5e-5,
+    ),
+    "style-strong": TrainPreset(
+        description="more faithful style capture",
+        rank=32,
+        steps=3000,
+        learning_rate=5e-5,
+    ),
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,8 +123,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lorakit")
-    parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--output", choices=["text", "json", "jsonl"], default="text")
+    _add_global_options(parser, root=True)
     subparsers = parser.add_subparsers(dest="command")
 
     _add_candidates(subparsers)
@@ -54,49 +134,71 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_global_options(parser: argparse.ArgumentParser, *, root: bool = False) -> None:
+    parser.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR if root else argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--output",
+        choices=["text", "json", "jsonl"],
+        default=DEFAULT_OUTPUT if root else argparse.SUPPRESS,
+    )
+
+
 def _add_candidates(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("candidates")
+    _add_global_options(parser)
     commands = parser.add_subparsers(dest="candidate_command", required=True)
 
     import_parser = commands.add_parser("import")
+    _add_global_options(import_parser)
     import_parser.add_argument("source")
     import_parser.add_argument("importer_args", nargs=argparse.REMAINDER)
     import_parser.add_argument("--overwrite", action="store_true")
     import_parser.set_defaults(handler=_cmd_candidates_import)
 
     list_parser = commands.add_parser("list")
+    _add_global_options(list_parser)
     list_parser.set_defaults(handler=_cmd_candidates_list)
 
     show_parser = commands.add_parser("show")
+    _add_global_options(show_parser)
     show_parser.add_argument("stem")
     show_parser.set_defaults(handler=_cmd_candidates_show)
 
 
 def _add_clean(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("clean")
+    _add_global_options(parser)
     parser.add_argument("--apply", action="store_true")
     parser.set_defaults(handler=_cmd_clean)
 
 
 def _add_dataset(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("dataset")
+    _add_global_options(parser)
     commands = parser.add_subparsers(dest="dataset_command", required=True)
 
     create_parser = commands.add_parser("create")
+    _add_global_options(create_parser)
     create_parser.add_argument("name")
     create_parser.set_defaults(handler=_cmd_dataset_create)
 
     delete_parser = commands.add_parser("delete")
+    _add_global_options(delete_parser)
     delete_parser.add_argument("name")
     delete_parser.add_argument("--yes", action="store_true")
     delete_parser.set_defaults(handler=_cmd_dataset_delete)
 
     rename_parser = commands.add_parser("rename")
+    _add_global_options(rename_parser)
     rename_parser.add_argument("old")
     rename_parser.add_argument("new")
     rename_parser.set_defaults(handler=_cmd_dataset_rename)
 
     stage_parser = commands.add_parser("stage")
+    _add_global_options(stage_parser)
     stage_parser.add_argument("dataset")
     stage_parser.add_argument("image", nargs="?")
     stage_parser.add_argument("--symlink", action="store_true")
@@ -104,18 +206,22 @@ def _add_dataset(subparsers: argparse._SubParsersAction) -> None:
     stage_parser.set_defaults(handler=_cmd_dataset_stage)
 
     unstage_parser = commands.add_parser("unstage")
+    _add_global_options(unstage_parser)
     unstage_parser.add_argument("dataset")
     unstage_parser.add_argument("image")
     unstage_parser.set_defaults(handler=_cmd_dataset_unstage)
 
     list_parser = commands.add_parser("list")
+    _add_global_options(list_parser)
     list_parser.set_defaults(handler=_cmd_dataset_list)
 
     status_parser = commands.add_parser("status")
+    _add_global_options(status_parser)
     status_parser.add_argument("name")
     status_parser.set_defaults(handler=_cmd_dataset_status)
 
     prepare_parser = commands.add_parser("prepare")
+    _add_global_options(prepare_parser)
     prepare_parser.add_argument("dataset")
     _add_prepare_options(prepare_parser)
     prepare_parser.set_defaults(handler=_cmd_dataset_prepare)
@@ -123,45 +229,78 @@ def _add_dataset(subparsers: argparse._SubParsersAction) -> None:
 
 def _add_models(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("models")
+    _add_global_options(parser)
     commands = parser.add_subparsers(dest="models_command", required=True)
 
     list_parser = commands.add_parser("list")
+    _add_global_options(list_parser)
     list_parser.set_defaults(handler=_cmd_models_list)
 
     search_parser = commands.add_parser("search")
+    _add_global_options(search_parser)
     search_parser.add_argument("query")
     search_parser.add_argument("--task", default="text-to-image")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.set_defaults(handler=_cmd_models_search)
 
     fetch_parser = commands.add_parser("fetch")
+    _add_global_options(fetch_parser)
     fetch_parser.add_argument("repo_id")
     fetch_parser.add_argument("--name")
     fetch_parser.set_defaults(handler=_cmd_models_fetch)
 
     remove_parser = commands.add_parser("remove")
+    _add_global_options(remove_parser)
     remove_parser.add_argument("name")
     remove_parser.add_argument("--yes", action="store_true")
     remove_parser.set_defaults(handler=_cmd_models_remove)
 
 
 def _add_train(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("train")
+    parser = subparsers.add_parser(
+        "train",
+        description="Train a LoRA from a staged dataset.",
+        epilog=_train_preset_help(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_global_options(parser)
     parser.add_argument("dataset")
     parser.add_argument("--model", default="sd15")
     parser.add_argument("--backend", default="diffusers")
     parser.add_argument("--resolution", type=int, default=512)
-    parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--gradient-accumulation", type=int, default=4)
+    parser.add_argument(
+        "--preset",
+        choices=sorted(TRAIN_PRESETS),
+        help="training preset; individual train flags still override preset values",
+    )
+    parser.add_argument("--rank", type=int)
+    parser.add_argument("--steps", type=int)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--gradient-accumulation", type=int)
     parser.add_argument("--mixed-precision", default="fp16")
     parser.add_argument("--run-name")
     parser.add_argument("--no-prepare", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     _add_prepare_options(parser, include_size=True)
     parser.set_defaults(handler=_cmd_train)
+
+
+def _train_preset_help() -> str:
+    lines = ["presets:"]
+    for name in sorted(TRAIN_PRESETS):
+        preset = TRAIN_PRESETS[name]
+        lines.append(
+            "  "
+            f"{name:<18} {preset.description}; "
+            f"rank={preset.rank}, steps={preset.steps}, "
+            f"lr={preset.learning_rate:g}, batch={preset.batch_size}, "
+            f"grad_accum={preset.gradient_accumulation}"
+        )
+    lines.append("")
+    lines.append("Preset values are defaults. Pass --rank, --steps, --learning-rate,")
+    lines.append("--batch-size, or --gradient-accumulation to override individual fields.")
+    return "\n".join(lines)
 
 
 def _add_prepare_options(
@@ -184,6 +323,11 @@ def _add_prepare_options(
 
 def _cmd_candidates_import(args: argparse.Namespace) -> Any:
     importer_args = list(args.importer_args)
+    importer_args, data_dir, output = _extract_import_global_options(importer_args)
+    if data_dir is not None:
+        args.data_dir = data_dir
+    if output is not None:
+        args.output = output
     overwrite = args.overwrite
     if "--overwrite" in importer_args:
         importer_args.remove("--overwrite")
@@ -193,6 +337,45 @@ def _cmd_candidates_import(args: argparse.Namespace) -> Any:
         importer_args,
         overwrite=overwrite,
     )
+
+
+def _extract_import_global_options(
+    importer_args: list[str],
+) -> tuple[list[str], str | None, str | None]:
+    remaining: list[str] = []
+    data_dir: str | None = None
+    output: str | None = None
+    index = 0
+    while index < len(importer_args):
+        argument = importer_args[index]
+        if argument == "--data-dir":
+            if index + 1 >= len(importer_args):
+                raise LorakitError("--data-dir requires a value")
+            data_dir = importer_args[index + 1]
+            index += 2
+        elif argument.startswith("--data-dir="):
+            data_dir = argument.removeprefix("--data-dir=")
+            if data_dir == "":
+                raise LorakitError("--data-dir requires a value")
+            index += 1
+        elif argument == "--output":
+            if index + 1 >= len(importer_args):
+                raise LorakitError("--output requires a value")
+            output = _validate_output(importer_args[index + 1])
+            index += 2
+        elif argument.startswith("--output="):
+            output = _validate_output(argument.removeprefix("--output="))
+            index += 1
+        else:
+            remaining.append(argument)
+            index += 1
+    return remaining, data_dir, output
+
+
+def _validate_output(value: str) -> str:
+    if value not in {"text", "json", "jsonl"}:
+        raise LorakitError(f"Invalid --output: {value}")
+    return value
 
 
 def _cmd_candidates_list(args: argparse.Namespace) -> Any:
@@ -280,17 +463,18 @@ def _cmd_models_remove(args: argparse.Namespace) -> Any:
 
 def _cmd_train(args: argparse.Namespace) -> Any:
     prepare_config = _prepare_config(args, default_size=args.resolution)
+    train_values = _train_values(args)
     return Project(args.data_dir).train(
         TrainingSpec(
             dataset=args.dataset,
             model=args.model,
             backend=args.backend,
             resolution=args.resolution,
-            rank=args.rank,
-            steps=args.steps,
-            learning_rate=args.learning_rate,
-            batch_size=args.batch_size,
-            gradient_accumulation=args.gradient_accumulation,
+            rank=train_values.rank,
+            steps=train_values.steps,
+            learning_rate=train_values.learning_rate,
+            batch_size=train_values.batch_size,
+            gradient_accumulation=train_values.gradient_accumulation,
             mixed_precision=args.mixed_precision,
             run_name=args.run_name,
             no_prepare=args.no_prepare,
@@ -298,6 +482,33 @@ def _cmd_train(args: argparse.Namespace) -> Any:
             prepare=prepare_config,
         )
     )
+
+
+def _train_values(args: argparse.Namespace) -> TrainPreset:
+    preset = TRAIN_PRESETS.get(args.preset) if args.preset is not None else None
+    return TrainPreset(
+        description="" if preset is None else preset.description,
+        rank=_value_or_default(args.rank, preset.rank if preset else DEFAULT_RANK),
+        steps=_value_or_default(args.steps, preset.steps if preset else DEFAULT_STEPS),
+        learning_rate=_value_or_default(
+            args.learning_rate,
+            preset.learning_rate if preset else DEFAULT_LEARNING_RATE,
+        ),
+        batch_size=_value_or_default(
+            args.batch_size,
+            preset.batch_size if preset else DEFAULT_BATCH_SIZE,
+        ),
+        gradient_accumulation=_value_or_default(
+            args.gradient_accumulation,
+            preset.gradient_accumulation if preset else DEFAULT_GRADIENT_ACCUMULATION,
+        ),
+    )
+
+
+def _value_or_default(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    return value
 
 
 def _prepare_config(args: argparse.Namespace, *, default_size: int) -> PrepareConfig:
