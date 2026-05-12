@@ -22,6 +22,7 @@ from lorakit.types import (
     ModelInfo,
     ModelResolution,
     PrepareConfig,
+    TagResult,
     TrainingResult,
     TrainingSpec,
 )
@@ -67,6 +68,20 @@ class _Candidates:
             self._paths,
             args,
             overwrite=overwrite,
+        )
+
+    def tag(
+        self,
+        *,
+        all_images: bool = False,
+        natural: bool = False,
+        limit: int | None = None,
+    ) -> list[TagResult]:
+        return candidates_module.tag(
+            self._paths,
+            all_images=all_images,
+            natural=natural,
+            limit=limit,
         )
 
 
@@ -133,4 +148,5 @@ __all__ = [
     "Project",
     "TrainingSpec",
     "TrainingResult",
+    "TagResult",
 ]

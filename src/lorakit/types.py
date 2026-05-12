@@ -92,6 +92,14 @@ class ImportResult:
 
 
 @dataclass(frozen=True)
+class TagResult:
+    stem: str
+    metadata: Path
+    added_tags: list[str]
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
 class ModelInfo:
     name: str
     type: Literal["checkpoint", "diffusers"]

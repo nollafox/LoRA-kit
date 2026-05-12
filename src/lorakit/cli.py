@@ -17,6 +17,7 @@ from lorakit.types import (
     DatasetSummary,
     ImportResult,
     ModelInfo,
+    TagResult,
     TrainingResult,
 )
 
@@ -166,6 +167,28 @@ def _add_candidates(subparsers: argparse._SubParsersAction) -> None:
     _add_global_options(show_parser)
     show_parser.add_argument("stem")
     show_parser.set_defaults(handler=_cmd_candidates_show)
+
+    tag_parser = commands.add_parser(
+        "tag",
+        description="Auto-tag candidate images with SmilingWolf, optionally adding JoyCaption tags.",
+    )
+    _add_global_options(tag_parser)
+    tag_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="tag every candidate image and merge tags into existing metadata",
+    )
+    tag_parser.add_argument(
+        "--natural",
+        action="store_true",
+        help="also add natural-language scene tags using JoyCaption",
+    )
+    tag_parser.add_argument(
+        "--limit",
+        type=int,
+        help="maximum number of candidate images to tag in this run",
+    )
+    tag_parser.set_defaults(handler=_cmd_candidates_tag)
 
 
 def _add_clean(subparsers: argparse._SubParsersAction) -> None:
@@ -386,6 +409,14 @@ def _cmd_candidates_show(args: argparse.Namespace) -> Any:
     return Project(args.data_dir).candidates.show(args.stem)
 
 
+def _cmd_candidates_tag(args: argparse.Namespace) -> Any:
+    return Project(args.data_dir).candidates.tag(
+        all_images=args.all,
+        natural=args.natural,
+        limit=args.limit,
+    )
+
+
 def _cmd_clean(args: argparse.Namespace) -> Any:
     return Project(args.data_dir).clean(apply=args.apply)
 
@@ -601,6 +632,8 @@ def _text(value: Any, args: argparse.Namespace) -> str:
             return _text_dataset_summaries(value)
         if all(isinstance(item, ModelInfo) for item in value):
             return _text_models(value)
+        if all(isinstance(item, TagResult) for item in value):
+            return _text_tag_results(value)
         return "\n".join(_text(item, args) for item in value)
     if is_dataclass(value):
         data = _jsonable(value)
@@ -704,6 +737,19 @@ def _text_import_result(result: ImportResult) -> str:
             f"Skipped:  {len(result.skipped)}",
         ]
     )
+
+
+def _text_tag_results(results: list[TagResult]) -> str:
+    tagged = [result for result in results if not result.skipped]
+    skipped = [result for result in results if result.skipped]
+    lines = [
+        f"Tagged:  {len(tagged)}",
+        f"Skipped: {len(skipped)}",
+    ]
+    for result in tagged:
+        tag_text = ", ".join(result.added_tags)
+        lines.append(f"{result.stem}\t+{len(result.added_tags)}\t{tag_text}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

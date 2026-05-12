@@ -6,7 +6,8 @@ from typing import Iterable
 from lorakit.errors import CandidateNotFound, LorakitError
 from lorakit.manifest import load_metadata
 from lorakit.paths import Paths
-from lorakit.types import Candidate
+from lorakit.tagging import ImageTagger, build_tagger, merge_tags, metadata_has_tags
+from lorakit.types import Candidate, TagResult
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
@@ -29,6 +30,50 @@ def show(paths: Paths, stem: str) -> dict[str, object]:
     if candidate.metadata is None:
         raise CandidateNotFound(f"Candidate metadata not found: {stem}")
     return load_metadata(candidate.metadata)
+
+
+def tag(
+    paths: Paths,
+    *,
+    all_images: bool = False,
+    natural: bool = False,
+    limit: int | None = None,
+    tagger: ImageTagger | None = None,
+) -> list[TagResult]:
+    paths.ensure()
+    active_tagger = tagger
+    results: list[TagResult] = []
+    tagged_count = 0
+    for candidate in list_all(paths):
+        if candidate.image is None:
+            continue
+        if limit is not None and tagged_count >= limit:
+            break
+        metadata_path = paths.candidates / f"{candidate.stem}.json"
+        if not all_images and metadata_has_tags(metadata_path):
+            results.append(
+                TagResult(
+                    stem=candidate.stem,
+                    metadata=metadata_path,
+                    added_tags=[],
+                    skipped=True,
+                )
+            )
+            continue
+        if active_tagger is None:
+            active_tagger = build_tagger(natural=natural)
+        tags = active_tagger.tags_for(candidate.image)
+        _, added = merge_tags(metadata_path, tags)
+        results.append(
+            TagResult(
+                stem=candidate.stem,
+                metadata=metadata_path,
+                added_tags=added,
+                skipped=False,
+            )
+        )
+        tagged_count += 1
+    return results
 
 
 def image_for_stem(paths: Paths, stem: str) -> Path | None:

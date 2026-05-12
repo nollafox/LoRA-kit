@@ -153,6 +153,14 @@ $ lorakit candidates show 000006394158
 
 `show` pretty-prints the candidate's JSON to stdout. Handy for grepping, scripting, or piping into another tool.
 
+```bash
+$ lorakit candidates tag [--all] [--natural] [--limit N]
+```
+
+`tag` creates or updates sibling JSON metadata for candidate images. By default it only touches images with no tags at all. `--all` tags every candidate image and merges new tags into existing metadata. Use `--limit N` for a small verification pass before tagging a full folder. The default tagger is [`SmilingWolf/wd-vit-tagger-v3`](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3), using its ONNX model and `selected_tags.csv`; this requires `onnxruntime >= 1.17.0`.
+
+`--natural` also runs [`fancyfeast/llama-joycaption-beta-one-hf-llava`](https://huggingface.co/fancyfeast/llama-joycaption-beta-one-hf-llava) to add natural-language scene tags. JoyCaption is built for diffusion-training captions, so this is useful when you want both WD-style tags and more descriptive phrases in the prepared caption.
+
 ### Datasets
 
 ```bash
@@ -342,6 +350,7 @@ There is no `lorakit init`. Commands auto-create any missing pieces of the data 
 lorakit candidates import 621 ... [--overwrite]
 lorakit candidates list
 lorakit candidates show <stem>
+lorakit candidates tag [--all] [--natural] [--limit N]
 lorakit clean [--apply]
 lorakit dataset create <name>
 lorakit dataset delete <name> [--yes]

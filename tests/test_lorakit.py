@@ -55,6 +55,67 @@ def test_candidates_list_broken_and_show_metadata(tmp_path):
     }
 
 
+def test_candidates_tag_only_missing_tags_by_default_and_merges_with_all(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "tagged", tags=["existing"])
+    _image(paths.candidates / "untagged.png")
+    project = Project(paths.root)
+
+    default_results = candidates_module.tag(paths, tagger=FakeTagger(["new_tag", "solo"]))
+
+    assert [(result.stem, result.skipped, result.added_tags) for result in default_results] == [
+        ("tagged", True, []),
+        ("untagged", False, ["new_tag", "solo"]),
+    ]
+    assert json.loads((paths.candidates / "untagged.json").read_text(encoding="utf-8"))[
+        "tags"
+    ] == ["new_tag", "solo"]
+
+    all_results = candidates_module.tag(
+        paths,
+        all_images=True,
+        tagger=FakeTagger(["new_tag", "solo"]),
+    )
+
+    assert [(result.stem, result.skipped) for result in all_results] == [
+        ("tagged", False),
+        ("untagged", False),
+    ]
+    assert json.loads((paths.candidates / "tagged.json").read_text(encoding="utf-8"))[
+        "tags"
+    ] == ["existing", "new_tag", "solo"]
+
+
+def test_candidates_tag_natural_uses_composite_tagger(tmp_path, monkeypatch):
+    paths = Paths(tmp_path / "data")
+    _image(paths.candidates / "0001.png")
+
+    def fake_build_tagger(*, natural):
+        assert natural is True
+        return FakeTagger(["smilingwolf_tag", "natural language tag"])
+
+    monkeypatch.setattr(candidates_module, "build_tagger", fake_build_tagger)
+
+    results = Project(paths.root).candidates.tag(natural=True)
+
+    assert results[0].added_tags == ["smilingwolf_tag", "natural language tag"]
+    assert json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))[
+        "tags"
+    ] == ["smilingwolf_tag", "natural language tag"]
+
+
+def test_candidates_tag_limit_bounds_tagged_images(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _image(paths.candidates / "0001.png")
+    _image(paths.candidates / "0002.png")
+
+    results = candidates_module.tag(paths, limit=1, tagger=FakeTagger(["tagged"]))
+
+    assert [(result.stem, result.skipped) for result in results] == [("0001", False)]
+    assert (paths.candidates / "0001.json").exists()
+    assert not (paths.candidates / "0002.json").exists()
+
+
 def test_dataset_lifecycle_stage_status_prepare_flags_and_delete(tmp_path):
     paths = Paths(tmp_path / "data")
     _candidate(paths, "0001")
@@ -585,6 +646,40 @@ def test_cli_import_extracts_trailing_data_dir_from_importer_args(tmp_path, monk
     assert (data_dir / "candidates" / "0001.json").exists()
 
 
+def test_cli_candidates_tag_uses_command_options(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "data"
+    paths = Paths(data_dir)
+    _candidate(paths, "0001", tags=["existing"])
+
+    def fake_build_tagger(*, natural):
+        assert natural is True
+        return FakeTagger(["new"])
+
+    monkeypatch.setattr(candidates_module, "build_tagger", fake_build_tagger)
+
+    assert (
+        main(
+            [
+                "candidates",
+                "tag",
+                "--data-dir",
+                str(data_dir),
+                "--all",
+                "--natural",
+                "--limit",
+                "1",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+
+    assert "Tagged:  1" in output
+    assert json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))[
+        "tags"
+    ] == ["existing", "new"]
+
+
 def test_cli_dataset_stage_all(tmp_path, capsys):
     data_dir = tmp_path / "data"
     paths = Paths(data_dir)
@@ -915,6 +1010,14 @@ def _six2one_metadata(
         },
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+class FakeTagger:
+    def __init__(self, tags):
+        self._tags = tags
+
+    def tags_for(self, image_path):
+        return list(self._tags)
 
 
 def _image_size(path: Path) -> tuple[int, int]:
