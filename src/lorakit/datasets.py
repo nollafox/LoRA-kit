@@ -92,6 +92,20 @@ def stage(paths: Paths, dataset: str, image: str | Path, *, symlink: bool = Fals
     return target
 
 
+def stage_all(paths: Paths, dataset: str, *, symlink: bool = False) -> list[Path]:
+    all_candidates = candidates.list_all(paths)
+    broken = [candidate.stem for candidate in all_candidates if candidate.is_broken]
+    if broken:
+        names = ", ".join(broken)
+        raise LorakitError(f"Cannot stage all candidates with broken entries: {names}")
+    staged: list[Path] = []
+    for candidate in all_candidates:
+        if candidate.image is None:
+            raise LorakitError(f"Candidate image missing after validation: {candidate.stem}")
+        staged.append(stage(paths, dataset, candidate.image, symlink=symlink))
+    return staged
+
+
 def unstage(paths: Paths, dataset: str, image: str | Path) -> Path:
     dataset_dir = _require_dataset(paths, dataset)
     target = _resolve_staged_target(dataset_dir, image)

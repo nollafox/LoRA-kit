@@ -31,6 +31,8 @@ def test_project_creates_data_layout(tmp_path):
     assert project.paths.staged.exists()
     assert project.paths.prepared.exists()
     assert project.paths.models.exists()
+    assert project.paths.models == tmp_path / "models"
+    assert not (tmp_path / "data" / "models").exists()
     assert project.paths.artifacts.exists()
 
 
@@ -92,6 +94,23 @@ def test_stage_can_symlink_and_replaces_existing_file(tmp_path):
 
     assert first == second
     assert second.is_symlink()
+
+
+def test_stage_all_adds_every_candidate_and_rejects_broken_entries(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "0001")
+    _candidate(paths, "0002")
+    project = Project(paths.root)
+    project.datasets.create("ds")
+
+    staged = project.datasets.stage_all("ds")
+
+    assert [path.name for path in staged] == ["0001.png", "0002.png"]
+    assert project.datasets.status("ds").staged_images == 2
+
+    _image(paths.candidates / "broken.png")
+    with pytest.raises(LorakitError, match="broken entries: broken"):
+        project.datasets.stage_all("ds")
 
 
 def test_clean_reports_and_deletes_candidate_and_staged_orphans(tmp_path):
@@ -510,6 +529,22 @@ def test_cli_create_list_json_and_error_paths(tmp_path, capsys):
     assert main(["--data-dir", str(data_dir), "dataset", "create", "ds"]) == 1
     stderr = capsys.readouterr().err
     assert "Dataset already exists" in stderr
+
+
+def test_cli_dataset_stage_all(tmp_path, capsys):
+    data_dir = tmp_path / "data"
+    paths = Paths(data_dir)
+    _candidate(paths, "0001")
+    _candidate(paths, "0002")
+    project = Project(paths.root)
+    project.datasets.create("ds")
+
+    assert main(["--data-dir", str(data_dir), "dataset", "stage", "ds", "--all"]) == 0
+    output = capsys.readouterr().out
+
+    assert "0001.png" in output
+    assert "0002.png" in output
+    assert project.datasets.status("ds").staged_images == 2
 
 
 def test_cli_text_output_matches_architecture_shapes(tmp_path, capsys):

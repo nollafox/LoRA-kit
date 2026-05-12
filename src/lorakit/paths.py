@@ -6,9 +6,13 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class Paths:
-    """Resolved locations under a lorakit data directory."""
+    """Resolved locations for a lorakit project rooted beside the data directory."""
 
     root: Path
+
+    @property
+    def project_root(self) -> Path:
+        return self.root.parent
 
     @property
     def candidates(self) -> Path:
@@ -24,7 +28,7 @@ class Paths:
 
     @property
     def models(self) -> Path:
-        return self.root / "models"
+        return self.project_root / "models"
 
     @property
     def artifacts(self) -> Path:

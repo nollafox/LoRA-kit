@@ -37,8 +37,7 @@ That installs the `lorakit` command onto your `PATH`. A typical session imports 
 ```bash
 $ lorakit candidates import 621 fox solo --safe --limit 100
 $ lorakit dataset create fox-solo
-$ lorakit dataset stage fox-solo 000006394158
-$ lorakit dataset stage fox-solo 000006394159
+$ lorakit dataset stage fox-solo --all
 $ lorakit dataset prepare fox-solo --size 768 --trigger lorakit
 $ lorakit train fox-solo --model sd15
 ```
@@ -51,7 +50,7 @@ For an isolated install, use `pipx install lorakit`. For an editable install fro
 
 ## How lorakit Organizes Things
 
-Everything lorakit does happens inside `data/`. There are four working directories, each with a clear job:
+Dataset work happens inside `data/`. Base checkpoints live beside it in `models/`, so large model files stay separate from the material lorakit stages, prepares, and archives.
 
 ```
 data/
@@ -67,7 +66,6 @@ data/
       images/
       lorakit-manifest.jsonl
       config.json
-  models/                    # Base checkpoints available for training
   artifacts/
     fox-solo/
       run-001/               # A finished training run
@@ -76,6 +74,7 @@ data/
           lorakit-manifest.jsonl
         model.safetensors
         config.json
+models/                      # Base checkpoints available for training
 ```
 
 **`candidates/`** is the pool of source material. Each candidate is an image plus a sibling JSON file with the same stem. Importers like `six2one` write here, and you can drop files in by hand whenever the pair stays matched.
@@ -101,6 +100,8 @@ A staged image uses the candidate's metadata by default. To override the tags fo
 **`prepared/<name>/`** is the training-ready build of a dataset. The preprocessed images live under `images/`, alongside a manifest describing them and the config used to build them. It's regenerated from scratch on every prepare or train, so treat it as disposable — never edit by hand, never depend on it across runs.
 
 **`artifacts/<dataset>/run-NNN/`** is the durable record of a finished run. The trained LoRA, the config used, and a copied snapshot of the prepared inputs all sit together. Old runs stay reproducible even when the source dataset changes later, because every run carries its own inputs. Run numbers count up per dataset.
+
+**`models/`** is the root-level home for base checkpoints and Diffusers model directories. `lorakit models fetch` writes here, `lorakit models list` discovers entries here, and `lorakit train --model sd15` resolves `sd15` from this folder before treating it as a Hugging Face repo ID.
 
 ## The Manifest
 
@@ -158,6 +159,7 @@ $ lorakit candidates show 000006394158
 $ lorakit dataset create fox-solo
 $ lorakit dataset stage fox-solo 000006394158
 $ lorakit dataset stage fox-solo 000006394159 --symlink
+$ lorakit dataset stage fox-solo --all
 $ lorakit dataset unstage fox-solo 000006394159
 $ lorakit dataset list
 $ lorakit dataset status fox-solo
@@ -165,7 +167,7 @@ $ lorakit dataset rename fox-solo fox-solo-v2
 $ lorakit dataset delete fox-solo-v2 [--yes]
 ```
 
-`stage` copies an image from `candidates/` into the dataset folder. The image keeps its candidate metadata by default. To override the tags for this dataset, drop a JSON file next to it with the same stem.
+`stage` copies an image from `candidates/` into the dataset folder. Pass a candidate stem for one image, or `--all` to stage every valid candidate at once. The image keeps its candidate metadata by default. To override the tags for this dataset, drop a JSON file next to it with the same stem.
 
 `--symlink` substitutes a symlink for the copy. That saves space, at the cost of hand-editability — the linked file still lives back in `candidates/`.
 
@@ -219,12 +221,12 @@ The `models` group manages the base checkpoints you train on top of.
 $ lorakit models list
 
 # NAME        TYPE        FORMAT       PATH
-# sd15        checkpoint  safetensors  data/models/sd15.safetensors
-# pony-v6     checkpoint  safetensors  data/models/pony-v6.safetensors
-# sdxl-base   diffusers   directory    data/models/sdxl-base
+# sd15        checkpoint  safetensors  models/sd15.safetensors
+# pony-v6     checkpoint  safetensors  models/pony-v6.safetensors
+# sdxl-base   diffusers   directory    models/sdxl-base
 ```
 
-Two formats are discovered automatically under `data/models/`:
+Two formats are discovered automatically under `models/`:
 
 - Single checkpoint files: `*.safetensors`, `*.ckpt`, `*.pt`.
 - Diffusers model directories: any folder containing `model_index.json`.
@@ -237,9 +239,11 @@ $ lorakit models remove pony-v6 [--yes]
 
 `search` queries Hugging Face via `huggingface_hub.HfApi.list_models()` and respects its filters.
 
-`fetch` downloads a Hugging Face repository snapshot into `data/models/<name>/`. `--name` defaults to the remote name. Private or gated repos use the standard `HF_TOKEN` environment variable or a prior `hf auth login`.
+`fetch` downloads a Hugging Face repository snapshot into `models/<name>/`. `--name` defaults to the remote name. Private or gated repos use the standard `HF_TOKEN` environment variable or a prior `hf auth login`.
 
-`remove` resolves the local name using the same rules as the `--model` flag — `data/models/<name>/`, then `data/models/<name>.*` — and refuses to act on an ambiguous match.
+`remove` resolves the local name using the same rules as the `--model` flag — `models/<name>/`, then `models/<name>.*` — and refuses to act on an ambiguous match.
+
+You can also download checkpoints directly with the Hugging Face CLI. See [`models/README.md`](models/README.md) for a concrete `hf download` example.
 
 ### Training
 
@@ -273,8 +277,8 @@ Either way, the prepared dataset is copied into `artifacts/<dataset>/run-NNN/dat
 `--model` resolves in this order:
 
 1. A path that exists on disk.
-2. `data/models/<name>/` as a Diffusers directory.
-3. `data/models/<name>.*` as a checkpoint file.
+2. `models/<name>/` as a Diffusers directory.
+3. `models/<name>.*` as a checkpoint file.
 4. Otherwise, a Hugging Face repo ID.
 
 The resolved path is recorded in the run's `config.json` so future audits know which model was used.
@@ -309,7 +313,7 @@ Two flags apply across the CLI:
 
 | Flag | Where | Description |
 | --- | --- | --- |
-| `--data-dir <path>` | Every command. | Overrides the default `./data` location. Useful for tests and for keeping multiple projects in one install. |
+| `--data-dir <path>` | Every command. | Overrides the default `./data` location. The model directory is the sibling `models/` folder beside the selected data directory. |
 | `--output text\|json\|jsonl` | Commands that print structured results. | Defaults to `text`. Destructive commands ignore it. |
 
 There is no `lorakit init`. Commands auto-create any missing pieces of the data directory on first use.
@@ -327,6 +331,7 @@ lorakit dataset rename <old> <new>
 lorakit dataset list
 lorakit dataset status <name>
 lorakit dataset stage <dataset> <image> [--symlink]
+lorakit dataset stage <dataset> --all [--symlink]
 lorakit dataset unstage <dataset> <image>
 lorakit dataset prepare <dataset> [options]
 lorakit models list
@@ -361,7 +366,7 @@ from lorakit import Project, PrepareConfig, TrainingSpec
 p = Project("./data")
 p.candidates.import_from("621", ["fox", "solo", "--safe", "--limit", "100"])
 p.datasets.create("fox-solo")
-p.datasets.stage("fox-solo", "000006394158")
+p.datasets.stage_all("fox-solo")
 p.datasets.prepare("fox-solo", PrepareConfig(mode="center-crop", width=768))
 p.train(TrainingSpec(dataset="fox-solo", model="sd15"))
 ```

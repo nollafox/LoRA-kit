@@ -98,8 +98,9 @@ def _add_dataset(subparsers: argparse._SubParsersAction) -> None:
 
     stage_parser = commands.add_parser("stage")
     stage_parser.add_argument("dataset")
-    stage_parser.add_argument("image")
+    stage_parser.add_argument("image", nargs="?")
     stage_parser.add_argument("--symlink", action="store_true")
+    stage_parser.add_argument("--all", action="store_true")
     stage_parser.set_defaults(handler=_cmd_dataset_stage)
 
     unstage_parser = commands.add_parser("unstage")
@@ -221,6 +222,15 @@ def _cmd_dataset_rename(args: argparse.Namespace) -> None:
 
 
 def _cmd_dataset_stage(args: argparse.Namespace) -> Any:
+    if args.all and args.image is not None:
+        raise LorakitError("dataset stage accepts either an image or --all, not both")
+    if args.all:
+        return Project(args.data_dir).datasets.stage_all(
+            args.dataset,
+            symlink=args.symlink,
+        )
+    if args.image is None:
+        raise LorakitError("dataset stage requires an image or --all")
     return Project(args.data_dir).datasets.stage(
         args.dataset,
         args.image,

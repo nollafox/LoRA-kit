@@ -68,4 +68,6 @@ poetry.toml
 Thumbs.db
 
 data/*
+models/*
+!models/README.md
 architecture.md

@@ -92,6 +92,9 @@ class _Datasets:
     def stage(self, dataset: str, image: str | Path, *, symlink: bool = False) -> Path:
         return datasets_module.stage(self._paths, dataset, image, symlink=symlink)
 
+    def stage_all(self, dataset: str, *, symlink: bool = False) -> list[Path]:
+        return datasets_module.stage_all(self._paths, dataset, symlink=symlink)
+
     def unstage(self, dataset: str, image: str | Path) -> Path:
         return datasets_module.unstage(self._paths, dataset, image)
 

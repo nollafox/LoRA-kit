@@ -3210,4 +3210,4 @@ accel = ["xformers"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.13"
-content-hash = "948cadd0edd096a8428fec60086039299718c9e2a76c76a03e186364d11a0f62"
+content-hash = "1257edfd2257fe49737e04c44b9c4c8cb7f50635c0755d10c870e18af0eae9ea"
