@@ -77,8 +77,8 @@ def default_config(root: Path | None = None) -> ProjectConfig:
         name=project_root.name,
         root=project_root,
         data_dir=project_root / DEFAULT_DATA_DIR,
-        models_dir=project_root / "models",
-        huggingface_cache_dir=project_root / "models" / "cache",
+        models_dir=Path(DEFAULT_MODELS_DIR).expanduser(),
+        huggingface_cache_dir=Path(DEFAULT_HF_CACHE_DIR).expanduser(),
     )
 
 

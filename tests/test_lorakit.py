@@ -35,6 +35,11 @@ class FakeWatermarkRemover:
 
 
 @pytest.fixture(autouse=True)
+def isolated_lorakit_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+
+@pytest.fixture(autouse=True)
 def fake_watermark_remover(monkeypatch):
     monkeypatch.setattr(
         prepare_module,
@@ -45,13 +50,15 @@ def fake_watermark_remover(monkeypatch):
 
 def test_project_creates_data_layout(tmp_path):
     project = Project(tmp_path / "data")
+    shared_models = tmp_path / "home" / ".lorakit" / "models"
 
     assert project.paths.candidates.exists()
     assert project.paths.staged.exists()
     assert project.paths.prepared.exists()
     assert project.paths.models.exists()
-    assert project.paths.models == tmp_path / "models"
+    assert project.paths.models == shared_models
     assert not (tmp_path / "data" / "models").exists()
+    assert not (tmp_path / "models").exists()
     assert project.paths.artifacts.exists()
 
 
@@ -949,7 +956,6 @@ def test_models_list_resolve_remove_search_and_fetch(tmp_path, monkeypatch):
     assert project.models.resolve(str(paths.models / "pony.ckpt")).source == "path"
     assert project.models.resolve("owner/repo").repo_id == "owner/repo"
     assert project.models.resolve("missing").repo_id == "missing"
-    assert project.models.resolve("sd15").repo_id == models_module.SD15_REPO_ID
     assert project.models.resolve("not-a-model").path == paths.models / "not-a-model"
 
     (paths.models / "ambiguous.ckpt").write_bytes(b"model")
@@ -986,6 +992,12 @@ def test_models_list_resolve_remove_search_and_fetch(tmp_path, monkeypatch):
     assert project.models.search("fox", limit=1)[0]["model_id"] == "owner/model"
     assert project.models.fetch("owner/new-model").name == "model.safetensors"
     assert project.models.remove("pony").name == "pony.ckpt"
+
+
+def test_models_resolve_sd15_alias_when_no_local_match(tmp_path):
+    project = Project(tmp_path / "data")
+
+    assert project.models.resolve("sd15").repo_id == models_module.SD15_REPO_ID
 
 
 def test_models_fetch_rejects_multiple_safetensors_when_not_interactive(tmp_path, monkeypatch):

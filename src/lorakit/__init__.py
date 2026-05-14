@@ -11,7 +11,13 @@ import lorakit.importers as importers_module
 import lorakit.models as models_module
 import lorakit.prepare as prepare_module
 import lorakit.training as training_module
-from lorakit.config import ProjectConfig, default_config, discover_config
+from lorakit.config import (
+    DEFAULT_HF_CACHE_DIR,
+    DEFAULT_MODELS_DIR,
+    ProjectConfig,
+    default_config,
+    discover_config,
+)
 from lorakit.errors import ImporterMissing
 from lorakit.paths import Paths
 from lorakit.types import (
@@ -38,7 +44,6 @@ class Project:
         *,
         config: ProjectConfig | None = None,
     ):
-        legacy_data_dir = config is None
         active_config = config
         if active_config is None:
             root = Path(data_dir).expanduser().resolve()
@@ -46,8 +51,8 @@ class Project:
                 name=root.parent.name,
                 root=root.parent,
                 data_dir=root,
-                models_dir=root.parent / "models",
-                huggingface_cache_dir=root.parent / "models" / "cache",
+                models_dir=Path(DEFAULT_MODELS_DIR).expanduser(),
+                huggingface_cache_dir=Path(DEFAULT_HF_CACHE_DIR).expanduser(),
             )
         self.config = active_config
         self.paths = Paths(
@@ -57,8 +62,7 @@ class Project:
             huggingface_cache_directory=active_config.huggingface_cache_dir,
         )
         self.paths.ensure()
-        if legacy_data_dir:
-            self.paths.ensure_models()
+        self.paths.ensure_models()
         self.candidates = _Candidates(self.paths)
         self.datasets = _Datasets(self.paths)
         self.models = _Models(self.paths)

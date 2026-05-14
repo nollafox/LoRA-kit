@@ -31,11 +31,11 @@ class Paths:
 
     @property
     def models(self) -> Path:
-        return self.models_directory or self.project_root / "models"
+        return self.models_directory or default_model_home()
 
     @property
     def huggingface_cache(self) -> Path:
-        return self.huggingface_cache_directory or self.models / "cache"
+        return self.huggingface_cache_directory or default_huggingface_cache()
 
     @property
     def artifacts(self) -> Path:
@@ -64,3 +64,11 @@ class Paths:
         """Create configured model storage directories."""
         for path in (self.models, self.huggingface_cache):
             path.mkdir(parents=True, exist_ok=True)
+
+
+def default_model_home() -> Path:
+    return Path.home() / ".lorakit" / "models"
+
+
+def default_huggingface_cache() -> Path:
+    return default_model_home() / "cache"
