@@ -18,7 +18,6 @@ HF_CACHE_DIR = MODEL_DIR / "cache"
 
 SD15_REPO_ID = "runwayml/stable-diffusion-v1-5"
 SD15_FILENAME = "v1-5-pruned-emaonly.safetensors"
-SD15_TARGET_NAME = "stable-diffusion-v1-5.safetensors"
 
 SMILINGWOLF_REPO_ID = "SmilingWolf/wd-vit-tagger-v3"
 SMILINGWOLF_MODEL_FILE = "model.onnx"
@@ -31,6 +30,27 @@ RAM_PLUS_FILENAME = "ram_plus_swin_large_14m.pth"
 DEFAULT_QWEN_VL_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 CHECKPOINT_EXTENSIONS = {".safetensors", ".ckpt", ".pt"}
+MODEL_ALIASES = {
+    "sd15": SD15_REPO_ID,
+}
+HF_CACHE_PATTERNS = (
+    "*.bin",
+    "*.json",
+    "*.model",
+    "*.py",
+    "*.safetensors",
+    "*.txt",
+    "*.yaml",
+    "*.yml",
+    "merges.txt",
+    "preprocessor_config.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "tokenizer/*",
+    "unet/*",
+    "vae/*",
+    "vocab.json",
+)
 
 
 def install(paths: Paths, *, with_models: bool = False) -> Path:
@@ -45,37 +65,32 @@ def _install_known_models(paths: Paths) -> None:
         models_dir=paths.models,
         cache_dir=paths.huggingface_cache,
     )
-    _install_sd15(paths)
-    _snapshot_repo(paths, SMILINGWOLF_REPO_ID)
-    _snapshot_repo(paths, DEFAULT_PIPELINE_SMILINGWOLF_MODEL)
-    _snapshot_repo(paths, FLORENCE_PROMPTGEN_REPO_ID)
-    _snapshot_repo(paths, DEFAULT_CAPTION_EDITOR_MODEL)
-    _snapshot_repo(paths, RAM_PLUS_REPO_ID)
-    _snapshot_repo(paths, DEFAULT_QWEN_VL_MODEL)
+    _cache_hf_file(paths, SD15_REPO_ID, SD15_FILENAME)
+    _cache_hf_file(paths, SMILINGWOLF_REPO_ID, SMILINGWOLF_MODEL_FILE)
+    _cache_hf_file(paths, SMILINGWOLF_REPO_ID, SMILINGWOLF_TAGS_FILE)
+    _cache_hf_repo(paths, DEFAULT_PIPELINE_SMILINGWOLF_MODEL)
+    _cache_hf_repo(paths, FLORENCE_PROMPTGEN_REPO_ID)
+    _cache_hf_repo(paths, DEFAULT_CAPTION_EDITOR_MODEL)
+    _cache_hf_file(paths, RAM_PLUS_REPO_ID, RAM_PLUS_FILENAME)
+    _cache_hf_repo(paths, DEFAULT_QWEN_VL_MODEL)
 
 
-def _install_sd15(paths: Paths) -> Path:
-    target = paths.models / SD15_TARGET_NAME
-    if target.exists():
-        return target
-    source = hf_hub_download(
-        repo_id=SD15_REPO_ID,
-        filename=SD15_FILENAME,
-        cache_dir=paths.huggingface_cache,
+def _cache_hf_file(paths: Paths, repo_id: str, filename: str) -> Path:
+    return Path(
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            cache_dir=paths.huggingface_cache,
+        )
     )
-    shutil.copy2(source, target)
-    return target
 
 
-def _snapshot_repo(paths: Paths, repo_id: str) -> Path:
-    target = paths.models / repo_id.rsplit("/", 1)[-1]
-    if target.exists():
-        return target
+def _cache_hf_repo(paths: Paths, repo_id: str) -> Path:
     return Path(
         snapshot_download(
             repo_id=repo_id,
-            local_dir=target,
             cache_dir=paths.huggingface_cache,
+            allow_patterns=HF_CACHE_PATTERNS,
         )
     )
 
@@ -203,4 +218,9 @@ def resolve(paths: Paths, model: str) -> ModelResolution:
     if len(matches) == 1:
         return ModelResolution(requested=model, source="local", path=matches[0], repo_id=None)
 
-    return ModelResolution(requested=model, source="huggingface", path=None, repo_id=model)
+    return ModelResolution(
+        requested=model,
+        source="huggingface",
+        path=None,
+        repo_id=MODEL_ALIASES.get(model, model),
+    )

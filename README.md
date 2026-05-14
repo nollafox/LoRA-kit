@@ -267,7 +267,7 @@ The `models` group manages the base checkpoints you train on top of.
 $ lorakit install --with-models
 ```
 
-`install --with-models` downloads LoRA-kit’s built-in model dependencies into the configured model directory and Hugging Face cache. That includes tagging/captioning models, the default SD 1.5 checkpoint, and the EasyOCR detector used by watermark removal. Run it once per configured model cache, then normal commands reuse those files.
+`install --with-models` warms LoRA-kit’s configured caches without mirroring whole Hugging Face repos into `models/`. Hugging Face assets are initialized in `~/.lorakit/models/cache` by default, while EasyOCR detector files live under the configured model directory. Run it once per configured cache, then normal commands reuse those files.
 
 ```bash
 $ lorakit models list

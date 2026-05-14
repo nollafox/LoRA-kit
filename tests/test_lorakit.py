@@ -78,24 +78,50 @@ def test_models_install_with_models_installs_watermark_models_in_configured_cach
         models_directory=tmp_path / "models",
         huggingface_cache_directory=tmp_path / "models" / "cache",
     )
-    calls = []
+    watermark_calls = []
+    file_calls = []
+    repo_calls = []
 
-    monkeypatch.setattr(models_module, "_install_sd15", lambda _: paths.models / "sd15")
-    monkeypatch.setattr(models_module, "_snapshot_repo", lambda *_: paths.models / "snapshot")
+    monkeypatch.setattr(
+        models_module,
+        "_cache_hf_file",
+        lambda *args: file_calls.append(args),
+    )
+    monkeypatch.setattr(
+        models_module,
+        "_cache_hf_repo",
+        lambda *args: repo_calls.append(args),
+    )
     monkeypatch.setattr(
         models_module,
         "ensure_watermark_models",
-        lambda **kwargs: calls.append(kwargs),
+        lambda **kwargs: watermark_calls.append(kwargs),
     )
 
     models_module.install(paths, with_models=True)
 
-    assert calls == [
+    assert watermark_calls == [
         {
             "models_dir": tmp_path / "models",
             "cache_dir": tmp_path / "models" / "cache",
         }
     ]
+    assert [
+        (repo_id, filename)
+        for _, repo_id, filename in file_calls
+    ] == [
+        (models_module.SD15_REPO_ID, models_module.SD15_FILENAME),
+        (models_module.SMILINGWOLF_REPO_ID, models_module.SMILINGWOLF_MODEL_FILE),
+        (models_module.SMILINGWOLF_REPO_ID, models_module.SMILINGWOLF_TAGS_FILE),
+        (models_module.RAM_PLUS_REPO_ID, models_module.RAM_PLUS_FILENAME),
+    ]
+    assert [repo_id for _, repo_id in repo_calls] == [
+        models_module.DEFAULT_PIPELINE_SMILINGWOLF_MODEL,
+        models_module.FLORENCE_PROMPTGEN_REPO_ID,
+        models_module.DEFAULT_CAPTION_EDITOR_MODEL,
+        models_module.DEFAULT_QWEN_VL_MODEL,
+    ]
+    assert not any((tmp_path / "models" / name).exists() for name in ("sd15", "snapshot"))
 
 
 def test_init_creates_project_config_and_commands_discover_it(tmp_path, monkeypatch):
@@ -923,6 +949,7 @@ def test_models_list_resolve_remove_search_and_fetch(tmp_path, monkeypatch):
     assert project.models.resolve(str(paths.models / "pony.ckpt")).source == "path"
     assert project.models.resolve("owner/repo").repo_id == "owner/repo"
     assert project.models.resolve("missing").repo_id == "missing"
+    assert project.models.resolve("sd15").repo_id == models_module.SD15_REPO_ID
     assert project.models.resolve("not-a-model").path == paths.models / "not-a-model"
 
     (paths.models / "ambiguous.ckpt").write_bytes(b"model")
