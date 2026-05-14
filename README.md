@@ -35,6 +35,9 @@ $ python -m pip install lorakit
 That installs the `lorakit` command onto your `PATH`. A typical session imports source images, stages a curated subset, prepares them, and trains:
 
 ```bash
+$ lorakit init fox-solo
+$ cd fox-solo
+$ lorakit install --with-models
 $ lorakit candidates import 621 fox solo --safe --limit 100
 $ lorakit dataset create fox-solo
 $ lorakit dataset stage fox-solo --all
@@ -50,7 +53,9 @@ For an isolated install, use `pipx install lorakit`. For an editable install fro
 
 ## How lorakit Organizes Things
 
-Dataset work happens inside `data/`. Base checkpoints live beside it in `models/`, so large model files stay separate from the material lorakit stages, prepares, and archives.
+`lorakit init <folder-name>` creates a project folder with a `lorakit.yaml` file. Commands automatically discover that file by walking upward from the current working directory, so you can run `lorakit dataset list` from the project root or from a nested folder inside it.
+
+Dataset work happens inside `data/`. Base checkpoints default to `~/.lorakit/models`, and Hugging Face downloads cache under `~/.lorakit/models/cache`, so large model files stay shared across projects instead of being copied into every LoRA folder.
 
 ```
 data/
@@ -74,19 +79,26 @@ data/
           lorakit-manifest.jsonl
         model.safetensors
         config.json
-models/                      # Base checkpoints available for training
+lorakit.yaml                 # Project config
 ```
 
 **`candidates/`** is the pool of source material. Each candidate is an image plus a sibling JSON file with the same stem. Importers like `six2one` write here, and you can drop files in by hand whenever the pair stays matched.
 
-The JSON shape is open-ended. `tags` and `metadata` are the conventional fields:
+The JSON shape is open-ended. `tags`, `caption`, and `metadata` are the conventional fields:
 
 ```json
 {
-  "tags": ["anthro fox", "male", "solo", "blue eyes"],
+  "tags": ["anthro", "fox", "male", "solo", "blue_eyes"],
+  "caption": "An anthropomorphic male fox with blue eyes stands alone.",
   "metadata": {
     "source": "e621",
-    "post_id": 6394158
+    "post_id": 6394158,
+    "captioning": {
+      "draft_caption": "A digital illustration of a lemur-like character standing alone.",
+      "caption": "An anthropomorphic male fox with blue eyes stands alone.",
+      "caption_backend": "Florence-2-large-PromptGen",
+      "editor_backend": "Dolphin3.0-Llama3.1-8B"
+    }
   }
 }
 ```
@@ -101,23 +113,41 @@ A staged image uses the candidate's metadata by default. To override the tags fo
 
 **`artifacts/<dataset>/run-NNN/`** is the durable record of a finished run. The trained LoRA, the config used, and a copied snapshot of the prepared inputs all sit together. Old runs stay reproducible even when the source dataset changes later, because every run carries its own inputs. Run numbers count up per dataset.
 
-**`models/`** is the root-level home for base checkpoints and Diffusers model directories. `lorakit models fetch` writes here, `lorakit models list` discovers entries here, and `lorakit train --model sd15` resolves `sd15` from this folder before treating it as a Hugging Face repo ID.
+**`lorakit.yaml`** configures the project name, data directory, shared model directory, and Hugging Face cache directory. The default model directory is `~/.lorakit/models`.
 
 ## The Manifest
 
 Every prepared dataset comes with a `lorakit-manifest.jsonl`. One image per line, one JSON object per line:
 
 ```json
-{"image": "images/IMG_1.png", "caption": "lorakit, anthro fox, male, solo, blue eyes", "tags": ["lorakit", "anthro fox", "male", "solo", "blue eyes"]}
+{"image": "images/IMG_1.png", "caption": "lorakit, anthro, fox, male, solo, blue_eyes. lorakit, anthro, fox, male, solo, blue eyes. lorakit. An anthropomorphic male fox with blue eyes stands alone.", "tags": ["anthro", "fox", "male", "solo", "blue_eyes", "blue eyes"]}
 ```
 
-Each row carries two views of the same information. `caption` is the comma-joined tag string that training backends actually read; if you pass `--trigger`, the trigger word is prepended here. `tags` keeps the structured list so downstream tools can use it without re-parsing. During prepare, underscore tags are kept and expanded with a space-separated companion, so `hi_res` becomes both `hi_res` and `hi res`.
+Each row carries the training prompt plus structured tags. `caption` is the prompt string that training backends actually read. `tags` keeps the structured list so downstream tools can use it without re-parsing. During prepare, underscore tags are kept and expanded with a space-separated companion, so `hi_res` becomes both `hi_res` and `hi res`.
+
+`dataset prepare` controls prompt composition with `--prompt-type`:
+
+| Prompt type | Uses |
+| --- | --- |
+| `tags` | Raw tags only, such as `iztli, anthro, fox, blue_eyes`. |
+| `natural` | Naturalized tags only, such as `iztli, anthro, fox, blue eyes`. |
+| `caption` | Top-level candidate `caption`; falls back to naturalized tags if no caption exists. |
+| `all` | Raw tags, naturalized tags, then top-level `caption` last. This is the default. |
 
 Different backends adapt cheaply. A Diffusers run, for instance, rewrites each row into `{"file_name": "...", "text": "..."}` on the way in.
 
 The manifest is rebuilt on every `dataset prepare`. The copy inside a finished run's `artifacts/<dataset>/run-NNN/dataset/` is the immutable record of what that run actually saw.
 
 ## Commands
+
+### Creating a project
+
+```bash
+$ lorakit init fox-solo
+$ cd fox-solo
+```
+
+`init` creates the folder if needed and writes `lorakit.yaml` at its root. After that, commands discover the project automatically from the current working directory. `--data-dir` still exists for scripts and tests, but normal project work should not need it.
 
 ### Importing candidates
 
@@ -154,12 +184,16 @@ $ lorakit candidates show 000006394158
 `show` pretty-prints the candidate's JSON to stdout. Handy for grepping, scripting, or piping into another tool.
 
 ```bash
-$ lorakit candidates tag [--all] [--natural] [--limit N]
+$ lorakit candidates caption --preset natural_language [--all] [--limit N] [--quiet]
+$ lorakit candidates caption --preset image_tags [--all] [--limit N] [--quiet]
+$ lorakit candidates caption --preset natural_language --preset image_tags --all
 ```
 
-`tag` creates or updates sibling JSON metadata for candidate images. By default it only touches images with no tags at all. `--all` tags every candidate image and merges new tags into existing metadata. Use `--limit N` for a small verification pass before tagging a full folder. The default tagger is [`SmilingWolf/wd-vit-tagger-v3`](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3), using its ONNX model and `selected_tags.csv`; this requires `onnxruntime >= 1.17.0`.
+`caption` creates or updates sibling JSON metadata for candidate images. By default it only touches images with no tags at all. `--all` captions every candidate image and merges new output into existing metadata. Use `--limit N` for a small verification pass before captioning a full folder. Captioning shows a progress bar by default; pass `--quiet` to hide it.
 
-`--natural` also runs [`fancyfeast/llama-joycaption-beta-one-hf-llava`](https://huggingface.co/fancyfeast/llama-joycaption-beta-one-hf-llava) to add natural-language scene tags. JoyCaption is built for diffusion-training captions, so this is useful when you want both WD-style tags and more descriptive phrases in the prepared caption.
+`--preset image_tags` uses [`SmilingWolf/wd-vit-tagger-v3`](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3), using its ONNX model and `selected_tags.csv`; this requires `onnxruntime >= 1.17.0`.
+
+`--preset natural_language` uses [`Disty0/Florence-2-large-PromptGen-v2.0`](https://huggingface.co/Disty0/Florence-2-large-PromptGen-v2.0), a Hugging Face Transformers-compatible conversion of [`MiaoshouAI/Florence-2-large-PromptGen-v2.0`](https://huggingface.co/MiaoshouAI/Florence-2-large-PromptGen-v2.0), to draft a visual caption. When existing metadata tags are available, LoRA-kit then uses [`dphn/Dolphin3.0-Llama3.1-8B`](https://huggingface.co/dphn/Dolphin3.0-Llama3.1-8B) as a local caption editor: source tags are treated as trusted, Florence is treated as a draft, and the corrected output is written to top-level `caption` with provenance in `metadata.captioning`. Pass `--preset` more than once to run multiple captioners in one command.
 
 ### Datasets
 
@@ -208,7 +242,9 @@ Preparation clears `prepared/<dataset>/` and rebuilds it from the staged images.
 | `--size N` | `512` | Shortcut for `--width N --height N`. Cannot be combined with `--width`/`--height`. |
 | `--width W` / `--height H` | from `--size` | Explicit target box. |
 | `--image-format` | `original` | `png`, `jpg`, `webp`, or `original`. |
-| `--trigger` | `""` | Trigger word prepended to every image's tags. |
+| `--trigger` | `""` | Trigger word prepended to the prepared prompt. |
+| `--prompt-type` | `all` | `tags`, `natural`, `caption`, or `all`. |
+| `--remove-watermarks` / `--no-remove-watermarks` | enabled | Remove text-like overlays before resizing. |
 
 The four modes differ in how they handle aspect ratio:
 
@@ -221,9 +257,17 @@ If you supply only one of `--width` or `--height`, `fit` constrains that one dim
 
 `--image-format original` passes the source format through. `png`, `jpg`, and `webp` convert. Converting a transparent source to `jpg` errors rather than silently flattening — handle transparency at the source, or use a format that supports it.
 
+Watermark removal uses the EasyOCR detector installed by `lorakit install --with-models`, then repairs selected regions with OpenCV inpainting. `dataset prepare` does not download detector weights itself; if the models are missing, it fails with instructions instead of reaching out mid-run. Pass `--no-remove-watermarks` when you want the source pixels copied or resized exactly as-is.
+
 ### Models
 
 The `models` group manages the base checkpoints you train on top of.
+
+```bash
+$ lorakit install --with-models
+```
+
+`install --with-models` downloads LoRA-kit’s built-in model dependencies into the configured model directory and Hugging Face cache. That includes tagging/captioning models, the default SD 1.5 checkpoint, and the EasyOCR detector used by watermark removal. Run it once per configured model cache, then normal commands reuse those files.
 
 ```bash
 $ lorakit models list
@@ -247,7 +291,7 @@ $ lorakit models remove pony-v6 [--yes]
 
 `search` queries Hugging Face via `huggingface_hub.HfApi.list_models()` and respects its filters.
 
-`fetch` downloads a Hugging Face repository snapshot into `models/<name>/`. `--name` defaults to the remote name. Private or gated repos use the standard `HF_TOKEN` environment variable or a prior `hf auth login`.
+`fetch` looks inside a Hugging Face repository for `.safetensors` files and downloads a single selected checkpoint into the configured model directory. If there is exactly one `.safetensors` file, LoRA-kit downloads it. If there are several, LoRA-kit prompts interactively so you can choose the right one. `--name` renames the local checkpoint. Private or gated repos use the standard `HF_TOKEN` environment variable or a prior `hf auth login`.
 
 `remove` resolves the local name using the same rules as the `--model` flag — `models/<name>/`, then `models/<name>.*` — and refuses to act on an ambiguous match.
 
@@ -339,18 +383,20 @@ Two flags apply across the CLI:
 
 | Flag | Where | Description |
 | --- | --- | --- |
-| `--data-dir <path>` | Every command. | Overrides the default `./data` location. You can put it before the command or on the command itself. The model directory is the sibling `models/` folder beside the selected data directory. |
+| `--data-dir <path>` | Every command. | Overrides project discovery and uses an explicit data directory. Mostly useful for tests and scripts. |
 | `--output text\|json\|jsonl` | Commands that print structured results. | Defaults to `text`. You can put it before the command or on the command itself. Destructive commands ignore it. |
 
-There is no `lorakit init`. Commands auto-create any missing pieces of the data directory on first use.
+Most project work starts with `lorakit init <folder-name>`, which writes `lorakit.yaml`. After that, commands discover the project automatically by walking upward from the current directory.
 
 ## Command Reference
 
 ```
+lorakit init <folder-name>
+lorakit install [--with-models]
 lorakit candidates import 621 ... [--overwrite]
 lorakit candidates list
 lorakit candidates show <stem>
-lorakit candidates tag [--all] [--natural] [--limit N]
+lorakit candidates caption --preset <natural_language|image_tags> [--preset ...] [--all] [--limit N] [--quiet]
 lorakit clean [--apply]
 lorakit dataset create <name>
 lorakit dataset delete <name> [--yes]

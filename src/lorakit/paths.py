@@ -9,10 +9,13 @@ class Paths:
     """Resolved locations for a lorakit project rooted beside the data directory."""
 
     root: Path
+    project_directory: Path | None = None
+    models_directory: Path | None = None
+    huggingface_cache_directory: Path | None = None
 
     @property
     def project_root(self) -> Path:
-        return self.root.parent
+        return self.project_directory or self.root.parent
 
     @property
     def candidates(self) -> Path:
@@ -28,7 +31,11 @@ class Paths:
 
     @property
     def models(self) -> Path:
-        return self.project_root / "models"
+        return self.models_directory or self.project_root / "models"
+
+    @property
+    def huggingface_cache(self) -> Path:
+        return self.huggingface_cache_directory or self.models / "cache"
 
     @property
     def artifacts(self) -> Path:
@@ -49,7 +56,11 @@ class Paths:
             self.candidates,
             self.staged,
             self.prepared,
-            self.models,
             self.artifacts,
         ):
+            path.mkdir(parents=True, exist_ok=True)
+
+    def ensure_models(self) -> None:
+        """Create configured model storage directories."""
+        for path in (self.models, self.huggingface_cache):
             path.mkdir(parents=True, exist_ok=True)

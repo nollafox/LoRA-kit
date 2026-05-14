@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from lorakit import PrepareConfig, Project, TrainingSpec
+from lorakit.config import CONFIG_NAME, init_project
 from lorakit.errors import LorakitError
 from lorakit.types import (
     Candidate,
@@ -23,7 +24,6 @@ from lorakit.types import (
 
 
 DEFAULT_PREPARE_SIZE = 512
-DEFAULT_DATA_DIR = "./data"
 DEFAULT_OUTPUT = "text"
 DEFAULT_RANK = 16
 DEFAULT_STEPS = 2000
@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = args.handler(args)
     except LorakitError as error:
-        print(f"error: {error}", file=sys.stderr)
+        print(f"{_red('error')}: {error}", file=sys.stderr)
         return 1
     if result is not None:
         _emit(result, args.output, args)
@@ -130,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_candidates(subparsers)
     _add_clean(subparsers)
     _add_dataset(subparsers)
+    _add_init(subparsers)
+    _add_install(subparsers)
     _add_models(subparsers)
     _add_train(subparsers)
     return parser
@@ -138,13 +140,22 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_global_options(parser: argparse.ArgumentParser, *, root: bool = False) -> None:
     parser.add_argument(
         "--data-dir",
-        default=DEFAULT_DATA_DIR if root else argparse.SUPPRESS,
+        default=None if root else argparse.SUPPRESS,
     )
     parser.add_argument(
         "--output",
         choices=["text", "json", "jsonl"],
         default=DEFAULT_OUTPUT if root else argparse.SUPPRESS,
     )
+
+
+def _add_init(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "init",
+        description="Create a new lorakit project folder.",
+    )
+    parser.add_argument("folder_name")
+    parser.set_defaults(handler=_cmd_init)
 
 
 def _add_candidates(subparsers: argparse._SubParsersAction) -> None:
@@ -168,27 +179,34 @@ def _add_candidates(subparsers: argparse._SubParsersAction) -> None:
     show_parser.add_argument("stem")
     show_parser.set_defaults(handler=_cmd_candidates_show)
 
-    tag_parser = commands.add_parser(
-        "tag",
-        description="Auto-tag candidate images with SmilingWolf, optionally adding JoyCaption tags.",
+    caption_parser = commands.add_parser(
+        "caption",
+        description="Caption candidate images with preset taggers.",
     )
-    _add_global_options(tag_parser)
-    tag_parser.add_argument(
+    _add_global_options(caption_parser)
+    caption_parser.add_argument(
         "--all",
         action="store_true",
-        help="tag every candidate image and merge tags into existing metadata",
+        help="caption every candidate image and merge tags into existing metadata",
     )
-    tag_parser.add_argument(
-        "--natural",
-        action="store_true",
-        help="also add natural-language scene tags using JoyCaption",
+    caption_parser.add_argument(
+        "--preset",
+        action="append",
+        choices=["natural_language", "image_tags"],
+        required=True,
+        help="caption preset to run; may be passed more than once",
     )
-    tag_parser.add_argument(
+    caption_parser.add_argument(
         "--limit",
         type=int,
-        help="maximum number of candidate images to tag in this run",
+        help="maximum number of candidate images to caption in this run",
     )
-    tag_parser.set_defaults(handler=_cmd_candidates_tag)
+    caption_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="hide captioning progress",
+    )
+    caption_parser.set_defaults(handler=_cmd_candidates_caption)
 
 
 def _add_clean(subparsers: argparse._SubParsersAction) -> None:
@@ -248,6 +266,20 @@ def _add_dataset(subparsers: argparse._SubParsersAction) -> None:
     prepare_parser.add_argument("dataset")
     _add_prepare_options(prepare_parser)
     prepare_parser.set_defaults(handler=_cmd_dataset_prepare)
+
+
+def _add_install(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("install")
+    _add_global_options(parser)
+    parser.add_argument(
+        "--with-models",
+        action="store_true",
+        help=(
+            "download bundled model dependencies into the configured models "
+            "and Hugging Face cache directories"
+        ),
+    )
+    parser.set_defaults(handler=_cmd_install)
 
 
 def _add_models(subparsers: argparse._SubParsersAction) -> None:
@@ -338,9 +370,23 @@ def _add_prepare_options(
     parser.add_argument("--height", type=int)
     parser.add_argument("--trigger", default="")
     parser.add_argument(
+        "--prompt-type",
+        choices=["tags", "natural", "caption", "all"],
+        default="all",
+    )
+    parser.add_argument(
         "--image-format",
         choices=["png", "jpg", "webp", "original"],
         default="original",
+    )
+    parser.add_argument(
+        "--remove-watermarks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "remove text-like watermarks during prepare; use "
+            "--no-remove-watermarks to disable"
+        ),
     )
 
 
@@ -355,7 +401,7 @@ def _cmd_candidates_import(args: argparse.Namespace) -> Any:
     if "--overwrite" in importer_args:
         importer_args.remove("--overwrite")
         overwrite = True
-    return Project(args.data_dir).candidates.import_from(
+    return _project_from_args(args).candidates.import_from(
         args.source,
         importer_args,
         overwrite=overwrite,
@@ -402,50 +448,63 @@ def _validate_output(value: str) -> str:
 
 
 def _cmd_candidates_list(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).candidates.list()
+    return _project_from_args(args).candidates.list()
 
 
 def _cmd_candidates_show(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).candidates.show(args.stem)
+    return _project_from_args(args).candidates.show(args.stem)
 
 
-def _cmd_candidates_tag(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).candidates.tag(
+def _cmd_candidates_caption(args: argparse.Namespace) -> Any:
+    return _project_from_args(args).candidates.caption(
         all_images=args.all,
-        natural=args.natural,
+        presets=args.preset,
         limit=args.limit,
+        quiet=args.quiet,
     )
 
 
+def _cmd_init(args: argparse.Namespace) -> Any:
+    config = init_project(Path(args.folder_name))
+    return {
+        "project": config.name,
+        "path": config.root,
+        "config": config.root / CONFIG_NAME,
+        "data": config.data_dir,
+        "models": config.models_dir,
+        "huggingface_cache": config.huggingface_cache_dir,
+    }
+
+
 def _cmd_clean(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).clean(apply=args.apply)
+    return _project_from_args(args).clean(apply=args.apply)
 
 
 def _cmd_dataset_create(args: argparse.Namespace) -> DatasetCreated:
-    path = Project(args.data_dir).datasets.create(args.name)
+    path = _project_from_args(args).datasets.create(args.name)
     return DatasetCreated(name=args.name, path=path)
 
 
 def _cmd_dataset_delete(args: argparse.Namespace) -> None:
     _confirm_or_error(args.yes, f"Delete dataset '{args.name}'?")
-    Project(args.data_dir).datasets.delete(args.name)
+    _project_from_args(args).datasets.delete(args.name)
 
 
 def _cmd_dataset_rename(args: argparse.Namespace) -> None:
-    Project(args.data_dir).datasets.rename(args.old, args.new)
+    _project_from_args(args).datasets.rename(args.old, args.new)
 
 
 def _cmd_dataset_stage(args: argparse.Namespace) -> Any:
     if args.all and args.image is not None:
         raise LorakitError("dataset stage accepts either an image or --all, not both")
     if args.all:
-        return Project(args.data_dir).datasets.stage_all(
+        return _project_from_args(args).datasets.stage_all(
             args.dataset,
             symlink=args.symlink,
         )
     if args.image is None:
         raise LorakitError("dataset stage requires an image or --all")
-    return Project(args.data_dir).datasets.stage(
+    return _project_from_args(args).datasets.stage(
         args.dataset,
         args.image,
         symlink=args.symlink,
@@ -453,30 +512,34 @@ def _cmd_dataset_stage(args: argparse.Namespace) -> Any:
 
 
 def _cmd_dataset_unstage(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).datasets.unstage(args.dataset, args.image)
+    return _project_from_args(args).datasets.unstage(args.dataset, args.image)
 
 
 def _cmd_dataset_list(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).datasets.list()
+    return _project_from_args(args).datasets.list()
 
 
 def _cmd_dataset_status(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).datasets.status(args.name)
+    return _project_from_args(args).datasets.status(args.name)
 
 
 def _cmd_dataset_prepare(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).datasets.prepare(
+    return _project_from_args(args).datasets.prepare(
         args.dataset,
         _prepare_config(args, default_size=DEFAULT_PREPARE_SIZE),
     )
 
 
 def _cmd_models_list(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).models.list()
+    return _project_from_args(args).models.list()
+
+
+def _cmd_install(args: argparse.Namespace) -> Any:
+    return _project_from_args(args).models.install(with_models=args.with_models)
 
 
 def _cmd_models_search(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).models.search(
+    return _project_from_args(args).models.search(
         args.query,
         task=args.task,
         limit=args.limit,
@@ -484,18 +547,18 @@ def _cmd_models_search(args: argparse.Namespace) -> Any:
 
 
 def _cmd_models_fetch(args: argparse.Namespace) -> Any:
-    return Project(args.data_dir).models.fetch(args.repo_id, name=args.name)
+    return _project_from_args(args).models.fetch(args.repo_id, name=args.name)
 
 
 def _cmd_models_remove(args: argparse.Namespace) -> Any:
     _confirm_or_error(args.yes, f"Remove model '{args.name}'?")
-    return Project(args.data_dir).models.remove(args.name)
+    return _project_from_args(args).models.remove(args.name)
 
 
 def _cmd_train(args: argparse.Namespace) -> Any:
     prepare_config = _prepare_config(args, default_size=args.resolution)
     train_values = _train_values(args)
-    return Project(args.data_dir).train(
+    return _project_from_args(args).train(
         TrainingSpec(
             dataset=args.dataset,
             model=args.model,
@@ -513,6 +576,13 @@ def _cmd_train(args: argparse.Namespace) -> Any:
             prepare=prepare_config,
         )
     )
+
+
+def _project_from_args(args: argparse.Namespace) -> Project:
+    data_dir = getattr(args, "data_dir", None)
+    if data_dir is not None:
+        return Project(data_dir)
+    return Project.from_current()
 
 
 def _train_values(args: argparse.Namespace) -> TrainPreset:
@@ -560,6 +630,8 @@ def _prepare_config(args: argparse.Namespace, *, default_size: int) -> PrepareCo
             height=None,
             image_format=args.image_format,
             trigger=args.trigger,
+            prompt_type=args.prompt_type,
+            remove_watermarks=args.remove_watermarks,
         )
     if getattr(args, "size", None) is not None:
         width = args.size
@@ -576,6 +648,8 @@ def _prepare_config(args: argparse.Namespace, *, default_size: int) -> PrepareCo
         height=height,
         image_format=args.image_format,
         trigger=args.trigger,
+        prompt_type=args.prompt_type,
+        remove_watermarks=args.remove_watermarks,
     )
 
 
@@ -616,7 +690,7 @@ def _text(value: Any, args: argparse.Namespace) -> str:
     if isinstance(value, CleanResult):
         return _text_clean_result(value)
     if isinstance(value, DatasetCreated):
-        return f"Created dataset {value.name} at {value.path}"
+        return f"{_green('created')} dataset {value.name}\n  path: {value.path}"
     if isinstance(value, DatasetStatus):
         return _text_dataset_status(value)
     if isinstance(value, ImportResult):
@@ -723,8 +797,8 @@ def _text_models(models: list[ModelInfo]) -> str:
 
 def _text_clean_result(result: CleanResult) -> str:
     if not result.orphans:
-        return "No orphans found."
-    action = "Deleted" if result.deleted else "Would delete"
+        return f"{_green('clean')} no orphans found"
+    action = _green("deleted") if result.deleted else _yellow("would delete")
     lines = [f"{action}: {len(result.orphans)}"]
     lines.extend(f"{orphan.path}\t{orphan.reason}" for orphan in result.orphans)
     return "\n".join(lines)
@@ -733,8 +807,8 @@ def _text_clean_result(result: CleanResult) -> str:
 def _text_import_result(result: ImportResult) -> str:
     return "\n".join(
         [
-            f"Imported: {len(result.imported)}",
-            f"Skipped:  {len(result.skipped)}",
+            f"{_green('imported')}: {len(result.imported)}",
+            f"{_yellow('skipped')}:  {len(result.skipped)}",
         ]
     )
 
@@ -743,13 +817,31 @@ def _text_tag_results(results: list[TagResult]) -> str:
     tagged = [result for result in results if not result.skipped]
     skipped = [result for result in results if result.skipped]
     lines = [
-        f"Tagged:  {len(tagged)}",
-        f"Skipped: {len(skipped)}",
+        f"{_green('captioned')}: {len(tagged)}",
+        f"{_yellow('skipped')}: {len(skipped)}",
     ]
     for result in tagged:
         tag_text = ", ".join(result.added_tags)
         lines.append(f"{result.stem}\t+{len(result.added_tags)}\t{tag_text}")
     return "\n".join(lines)
+
+
+def _green(text: str) -> str:
+    return _color(text, "32")
+
+
+def _yellow(text: str) -> str:
+    return _color(text, "33")
+
+
+def _red(text: str) -> str:
+    return _color(text, "31")
+
+
+def _color(text: str, code: str) -> str:
+    if not sys.stdout.isatty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
 
 
 if __name__ == "__main__":

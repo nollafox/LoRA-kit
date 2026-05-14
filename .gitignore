@@ -71,3 +71,4 @@ data/*
 models/*
 !models/README.md
 architecture.md
+TODO.md

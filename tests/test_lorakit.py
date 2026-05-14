@@ -6,7 +6,10 @@ import torch
 from PIL import Image
 
 import lorakit.models as models_module
+import lorakit.prepare as prepare_module
+import lorakit.tools.tagging as tagging_module
 import lorakit.training as training_module
+from lorakit.config import CONFIG_NAME, discover_config
 from lorakit import candidates as candidates_module
 from lorakit import PrepareConfig, Project, TrainingSpec
 from lorakit.cli import main
@@ -24,6 +27,22 @@ from lorakit.paths import Paths
 from lorakit.training.backends.types import BackendResult
 
 
+class FakeWatermarkRemover:
+    def process_file(self, input_path: Path, output_path: Path) -> str:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+        return "copied unchanged"
+
+
+@pytest.fixture(autouse=True)
+def fake_watermark_remover(monkeypatch):
+    monkeypatch.setattr(
+        prepare_module,
+        "build_watermark_remover",
+        lambda **_: FakeWatermarkRemover(),
+    )
+
+
 def test_project_creates_data_layout(tmp_path):
     project = Project(tmp_path / "data")
 
@@ -34,6 +53,86 @@ def test_project_creates_data_layout(tmp_path):
     assert project.paths.models == tmp_path / "models"
     assert not (tmp_path / "data" / "models").exists()
     assert project.paths.artifacts.exists()
+
+
+def test_models_install_creates_global_model_paths(tmp_path, monkeypatch):
+    paths = Paths(
+        tmp_path / "data",
+        models_directory=tmp_path / "models",
+        huggingface_cache_directory=tmp_path / "models" / "cache",
+    )
+
+    result = models_module.install(paths, with_models=False)
+
+    assert result == tmp_path / "models"
+    assert (tmp_path / "models").is_dir()
+    assert (tmp_path / "models" / "cache").is_dir()
+
+
+def test_models_install_with_models_installs_watermark_models_in_configured_cache(
+    tmp_path,
+    monkeypatch,
+):
+    paths = Paths(
+        tmp_path / "data",
+        models_directory=tmp_path / "models",
+        huggingface_cache_directory=tmp_path / "models" / "cache",
+    )
+    calls = []
+
+    monkeypatch.setattr(models_module, "_install_sd15", lambda _: paths.models / "sd15")
+    monkeypatch.setattr(models_module, "_snapshot_repo", lambda *_: paths.models / "snapshot")
+    monkeypatch.setattr(
+        models_module,
+        "ensure_watermark_models",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    models_module.install(paths, with_models=True)
+
+    assert calls == [
+        {
+            "models_dir": tmp_path / "models",
+            "cache_dir": tmp_path / "models" / "cache",
+        }
+    ]
+
+
+def test_init_creates_project_config_and_commands_discover_it(tmp_path, monkeypatch):
+    project_dir = tmp_path / "fox-project"
+
+    assert main(["init", str(project_dir)]) == 0
+
+    config_path = project_dir / CONFIG_NAME
+    assert config_path.exists()
+    assert "name: fox-project" in config_path.read_text(encoding="utf-8")
+    discovered = discover_config(project_dir / "nested" / "folder")
+    assert discovered is not None
+    assert discovered.root == project_dir
+    assert discovered.data_dir == project_dir / "data"
+    assert discovered.models_dir == Path.home() / ".lorakit" / "models"
+    assert discovered.huggingface_cache_dir == Path.home() / ".lorakit" / "models" / "cache"
+    config_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "name: fox-project",
+                "paths:",
+                "  data: data",
+                f"  models: {tmp_path / 'global-models'}",
+                f"  huggingface_cache: {tmp_path / 'global-models' / 'cache'}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    nested = project_dir / "nested" / "folder"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+
+    assert main(["dataset", "create", "ds"]) == 0
+    assert (project_dir / "data" / "staged" / "ds").exists()
 
 
 def test_candidates_list_broken_and_show_metadata(tmp_path):
@@ -86,22 +185,384 @@ def test_candidates_tag_only_missing_tags_by_default_and_merges_with_all(tmp_pat
     ] == ["existing", "new_tag", "solo"]
 
 
-def test_candidates_tag_natural_uses_composite_tagger(tmp_path, monkeypatch):
+def test_candidates_caption_presets_use_composite_tagger(tmp_path, monkeypatch):
     paths = Paths(tmp_path / "data")
     _image(paths.candidates / "0001.png")
 
-    def fake_build_tagger(*, natural):
-        assert natural is True
+    def fake_build_tagger(*, presets):
+        assert presets == ["natural_language", "image_tags"]
         return FakeTagger(["smilingwolf_tag", "natural language tag"])
 
     monkeypatch.setattr(candidates_module, "build_tagger", fake_build_tagger)
 
-    results = Project(paths.root).candidates.tag(natural=True)
+    results = Project(paths.root).candidates.caption(
+        presets=["natural_language", "image_tags"]
+    )
 
     assert results[0].added_tags == ["smilingwolf_tag", "natural language tag"]
     assert json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))[
         "tags"
     ] == ["smilingwolf_tag", "natural language tag"]
+
+
+def test_candidates_caption_passes_existing_tags_as_model_context(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "0001", tags=["anthro girl", "beige room"])
+    tagger = FakeTagger(["an anthropomorphic girl in a beige room"])
+
+    candidates_module.tag(paths, all_images=True, tagger=tagger, quiet=True)
+
+    assert tagger.contexts == [["anthro girl", "beige room"]]
+    assert json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))[
+        "tags"
+    ] == [
+        "anthro girl",
+        "beige room",
+        "an anthropomorphic girl in a beige room",
+    ]
+
+
+def test_candidates_caption_writes_top_level_caption_and_captioning_metadata(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "0001", tags=["anthro", "fox"])
+    tagger = FakeStructuredTagger(
+        tagging_module.TaggingResult(
+            tags=[],
+            caption="An anthropomorphic fox stands alone.",
+            draft_caption="A lemur-like character stands alone.",
+            caption_backend="Florence-2-large-PromptGen",
+            editor_backend="Dolphin3.0-Llama3.1-8B",
+        )
+    )
+
+    candidates_module.tag(paths, all_images=True, tagger=tagger, quiet=True)
+
+    metadata = json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))
+    assert metadata["tags"] == ["anthro", "fox"]
+    assert metadata["caption"] == "An anthropomorphic fox stands alone."
+    assert metadata["metadata"]["captioning"] == {
+        "draft_caption": "A lemur-like character stands alone.",
+        "caption": "An anthropomorphic fox stands alone.",
+        "caption_backend": "Florence-2-large-PromptGen",
+        "editor_backend": "Dolphin3.0-Llama3.1-8B",
+    }
+
+
+def test_candidates_caption_writes_pipeline_sidecar_and_final_tags(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "0001", tags=["anthro"])
+    sidecar = {
+        "semantic": {"caption": "A rough description."},
+        "final": {
+            "caption": "An anthropomorphic fox stands alone.",
+            "final_tags": ["anthro", "fox", "solo"],
+        },
+        "source_tags": {"qwen": ["fox", "solo"]},
+        "errors": [],
+    }
+    tagger = FakeStructuredTagger(
+        tagging_module.TaggingResult(
+            tags=["fox", "solo"],
+            caption="An anthropomorphic fox stands alone.",
+            draft_caption="A rough description.",
+            caption_backend="Qwen2.5-VL-7B-Instruct",
+            editor_backend="Qwen2.5-VL-7B-Instruct",
+            sidecar=sidecar,
+        )
+    )
+
+    candidates_module.tag(paths, all_images=True, tagger=tagger, quiet=True)
+
+    metadata = json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))
+    assert metadata["tags"] == ["anthro", "fox", "solo"]
+    assert metadata["caption"] == "An anthropomorphic fox stands alone."
+    assert metadata["metadata"]["tagging"] == sidecar
+
+
+def test_candidates_caption_writes_pipeline_results_iteratively(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "0001", tags=["existing"])
+    _candidate(paths, "0002", tags=["existing"])
+    tagger = FakeIterativeStructuredTagger(paths.candidates)
+
+    results = candidates_module.tag(paths, all_images=True, tagger=tagger, quiet=True)
+
+    assert [result.stem for result in results] == ["0001", "0002"]
+    assert tagger.first_saved_before_second is True
+    first = json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))
+    second = json.loads((paths.candidates / "0002.json").read_text(encoding="utf-8"))
+    assert first["tags"] == ["existing", "tag-0"]
+    assert first["caption"] == "Caption 0."
+    assert first["metadata"]["tagging"] == {"index": 0}
+    assert second["tags"] == ["existing", "tag-1"]
+    assert second["caption"] == "Caption 1."
+    assert second["metadata"]["tagging"] == {"index": 1}
+
+
+def test_pipeline_final_tags_fall_back_to_model_outputs_when_qwen_returns_empty():
+    merged = [
+        tagging_module.CandidateTag(
+            raw="animal",
+            tag="animal",
+            source="ram++",
+            namespace="objects",
+            confidence=0.78,
+            authority=0.9,
+            score=0.7,
+        ),
+        tagging_module.CandidateTag(
+            raw="potty",
+            tag="potty",
+            source="ram++",
+            namespace="objects",
+            confidence=0.78,
+            authority=0.9,
+            score=0.7,
+        ),
+    ]
+
+    assert tagging_module._final_tags_or_model_output_fallback(
+        {"final_tags": []},
+        merged,
+    ) == ["animal", "potty"]
+    assert tagging_module._final_tags_or_model_output_fallback(
+        {"final_tags": ["qwen tag"]},
+        merged,
+    ) == ["qwen tag"]
+
+
+def test_pipeline_final_tags_always_include_ram_tags():
+    assert tagging_module._with_required_tags(
+        ["qwen tag", "potty"],
+        ["potty", "toddler", "floor"],
+    ) == ["qwen tag", "potty", "toddler", "floor"]
+    assert tagging_module._ram_tags_from_candidate_record(
+        {"ram++": {"tags": ["potty", "toddler"]}}
+    ) == ["potty", "toddler"]
+
+
+def test_pipeline_content_type_becomes_required_tag():
+    assert tagging_module._content_type_tags({"content_type": "digital_art"}) == [
+        "digital art"
+    ]
+    assert tagging_module._content_type_tags({"content_type": "photo"}) == ["photo"]
+    assert tagging_module._content_type_tags({"content_type": "unknown"}) == []
+
+
+def test_pipeline_semantic_tags_become_required_tags():
+    semantic = {
+        "content_type": "digital_art",
+        "medium": ["illustration"],
+        "scene": ["forest"],
+        "objects": ["tree"],
+        "style": ["soft_shading"],
+        "composition": ["close-up"],
+        "attributes": ["blue_eyes"],
+        "actions": ["standing"],
+        "abstract_tags": ["calm"],
+        "visible_text": ["do not tag this"],
+        "uncertain": ["also skipped"],
+    }
+
+    assert tagging_module._semantic_tags_from_result(semantic) == [
+        "digital art",
+        "illustration",
+        "forest",
+        "tree",
+        "soft shading",
+        "close-up",
+        "blue eyes",
+        "standing",
+        "calm",
+    ]
+
+
+def test_pipeline_skips_smilingwolf_for_photo_semantics(monkeypatch):
+    tagger = tagging_module.PipelineTagger.__new__(tagging_module.PipelineTagger)
+    tagger._device = "cpu"
+    tagger._torch = FakeTorchModule()
+    request = tagging_module.TagRequest(Path("photo.jpg"), [])
+    candidate_record = {"ram++": {"tags": ["potty"]}, "smilingwolf": None, "errors": []}
+
+    def fail_load(*args, **kwargs):
+        raise AssertionError("SmilingWolf should not load for photo content")
+
+    monkeypatch.setattr(tagging_module, "_load_pipeline_source", fail_load)
+
+    tagger._smilingwolf_stage(
+        requests=[request],
+        candidate_records=[candidate_record],
+        semantic_records=[{"content_type": "photo"}],
+        quiet=True,
+    )
+
+    assert candidate_record["smilingwolf"] is None
+
+
+def test_pipeline_uses_smilingwolf_for_digital_art_semantics(monkeypatch):
+    tagger = tagging_module.PipelineTagger.__new__(tagging_module.PipelineTagger)
+    tagger._device = "cpu"
+    tagger._torch = FakeTorchModule()
+    request = tagging_module.TagRequest(Path("art.png"), [])
+    candidate_record = {"ram++": {"tags": ["fox"]}, "smilingwolf": None, "errors": []}
+
+    class FakeSmilingWolf:
+        def tag(self, image_path):
+            return {"general": [{"tag": "anthro", "confidence": 0.9}]}
+
+        def unload(self):
+            self.unloaded = True
+
+    def fake_load(name, source_class, *, device):
+        assert name == "smilingwolf"
+        return FakeSmilingWolf(), None
+
+    monkeypatch.setattr(tagging_module, "_load_pipeline_source", fake_load)
+
+    tagger._smilingwolf_stage(
+        requests=[request],
+        candidate_records=[candidate_record],
+        semantic_records=[{"content_type": "digital_art"}],
+        quiet=True,
+    )
+
+    assert candidate_record["smilingwolf"] == {
+        "general": [{"tag": "anthro", "confidence": 0.9}]
+    }
+
+
+def test_pipeline_sidecar_omits_raw_qwen_responses():
+    assert tagging_module._without_raw_response(
+        {"caption": "A caption.", "_raw_response": "raw"}
+    ) == {"caption": "A caption."}
+
+
+def test_florence_promptgen_uses_hf_compatible_image_text_model(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeTorch:
+        float32 = object()
+
+        class cuda:
+            @staticmethod
+            def is_available():
+                return False
+
+    class FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, repo_id, **kwargs):
+            captured["processor"] = (repo_id, kwargs)
+            return cls()
+
+    class FakeModel:
+        @classmethod
+        def from_pretrained(cls, repo_id, **kwargs):
+            captured["model"] = (repo_id, kwargs)
+            return cls()
+
+        def to(self, device):
+            captured["device"] = device
+            return self
+
+        def eval(self):
+            captured["eval"] = True
+            return self
+
+    real_import = __import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "torch":
+            return FakeTorch
+        if name == "transformers":
+            class FakeTransformers:
+                AutoModelForImageTextToText = FakeModel
+                AutoProcessor = FakeProcessor
+
+            return FakeTransformers
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    tagger = tagging_module.FlorencePromptGenTagger()
+    assert "model" not in captured
+
+    tagger._model_for_generation()
+
+    _, model_kwargs = captured["model"]
+    assert captured["model"][0] == "Disty0/Florence-2-large-PromptGen-v2.0"
+    assert captured["processor"][0] == "Disty0/Florence-2-large-PromptGen-v2.0"
+    assert model_kwargs == {"cache_dir": models_module.HF_CACHE_DIR}
+    assert captured["device"] == "cpu"
+    assert captured["eval"] is True
+
+
+def test_caption_editor_limits_tag_context():
+    tags = [f"very specific tag {index}" for index in range(200)]
+
+    selected = tagging_module._caption_editor_tags(tags)
+    text = ", ".join(selected)
+
+    assert len(text) <= 4000
+    assert "very specific tag 0" in text
+    assert "very specific tag 199" not in text
+
+
+def test_caption_editor_prompt_requires_natural_language():
+    prompt = tagging_module.CAPTION_EDITOR_SYSTEM_PROMPT
+
+    assert "Output natural language only." in prompt
+    assert "Do not output booru tags" in prompt
+    assert "Every trusted tag that describes visible content should be represented" in prompt
+    assert "Adult and explicit trusted tags are not optional" in prompt
+
+
+def test_clean_caption_output_removes_labels_and_explanations():
+    assert (
+        tagging_module.clean_caption_output(
+            'Corrected caption: "anthro fox, solo. A fox in a forest."\n\nI changed it.'
+        )
+        == "anthro fox, solo. A fox in a forest."
+    )
+
+
+def test_natural_language_preset_uses_pipeline_tagger(monkeypatch):
+    created = {}
+
+    class FakePipelineTagger:
+        def __init__(self):
+            created["pipeline"] = True
+
+    monkeypatch.setattr(tagging_module, "PipelineTagger", FakePipelineTagger)
+
+    tagger = tagging_module.build_tagger(presets=["natural_language", "image_tags"])
+
+    assert isinstance(tagger, FakePipelineTagger)
+    assert created == {"pipeline": True}
+
+
+def test_qwen_chat_image_uses_plain_paths_for_plus_filenames(tmp_path):
+    captured: dict[str, object] = {}
+    image_path = tmp_path / "best+toddler+potties.webp"
+    _image(image_path)
+    judge = tagging_module.QwenVLTagJudge.__new__(tagging_module.QwenVLTagJudge)
+    judge._device = "cpu"
+    judge._torch = FakeTorchModule()
+    judge._model = FakeGenerateModel()
+    judge._processor = FakeQwenProcessor()
+
+    def fake_process_vision_info(messages):
+        captured["messages"] = messages
+        return ["image"], None
+
+    judge._process_vision_info = fake_process_vision_info
+
+    judge._chat_image(image_path, "describe", max_new_tokens=4)
+
+    messages = captured["messages"]
+    image_value = messages[0]["content"][0]["image"]
+    assert image_value == str(image_path.resolve())
+    assert "%2B" not in image_value
+    assert not image_value.startswith("file://")
 
 
 def test_candidates_tag_limit_bounds_tagged_images(tmp_path):
@@ -206,9 +667,9 @@ def test_prepare_writes_manifest_and_supports_fit_center_crop_pad_and_copy(tmp_p
     assert _image_size(prepared / "images" / "wide.png") == (50, 25)
     assert read_manifest(prepared / MANIFEST_NAME) == [
         {
-            "caption": "lorakit, wide",
+            "caption": "lorakit, wide. lorakit, wide",
             "image": "images/wide.png",
-            "tags": ["lorakit", "wide"],
+            "tags": ["wide"],
         }
     ]
 
@@ -225,6 +686,33 @@ def test_prepare_writes_manifest_and_supports_fit_center_crop_pad_and_copy(tmp_p
     assert _image_size(prepared / "images" / "wide.png") == (100, 50)
 
 
+def test_prepare_uses_watermark_remover_by_default_and_can_disable_it(tmp_path, monkeypatch):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "item")
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "item")
+    calls = []
+
+    def fake_builder(**kwargs):
+        calls.append(kwargs)
+        return FakeWatermarkRemover()
+
+    monkeypatch.setattr(prepare_module, "build_watermark_remover", fake_builder)
+
+    project.datasets.prepare("ds", PrepareConfig(width=32, height=32))
+    assert len(calls) == 1
+    assert calls[0]["models_dir"] == paths.models
+    assert calls[0]["cache_dir"] == paths.huggingface_cache
+    assert calls[0]["allow_download"] is False
+
+    project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, remove_watermarks=False),
+    )
+    assert len(calls) == 1
+
+
 def test_prepare_uses_staged_metadata_override(tmp_path):
     paths = Paths(tmp_path / "data")
     _candidate(paths, "item", tags=["candidate"])
@@ -235,7 +723,7 @@ def test_prepare_uses_staged_metadata_override(tmp_path):
 
     prepared = project.datasets.prepare("ds", PrepareConfig(width=32, height=32))
 
-    assert read_manifest(prepared / MANIFEST_NAME)[0]["caption"] == "override"
+    assert read_manifest(prepared / MANIFEST_NAME)[0]["caption"] == "override. override"
 
 
 def test_prepare_expands_underscore_tags_from_candidate_and_override_metadata(tmp_path):
@@ -252,9 +740,78 @@ def test_prepare_expands_underscore_tags_from_candidate_and_override_metadata(tm
     rows = read_manifest(prepared / MANIFEST_NAME)
 
     assert rows[0]["tags"] == ["hi_res", "hi res", "solo"]
-    assert rows[0]["caption"] == "hi_res, hi res, solo"
+    assert rows[0]["caption"] == "hi_res, solo. hi res, solo"
     assert rows[1]["tags"] == ["blue_eyes", "blue eyes"]
-    assert rows[1]["caption"] == "blue_eyes, blue eyes"
+    assert rows[1]["caption"] == "blue_eyes, blue eyes. blue eyes, blue eyes"
+
+
+def test_prepare_prompt_type_modes_use_tags_natural_caption_and_all(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "item", tags=["anthro", "blue_eyes", "looking_at_viewer"])
+    metadata_path = paths.candidates / "item.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    payload["caption"] = "An anthropomorphic character with blue eyes looks at the viewer."
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "item")
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, trigger="iztli", prompt_type="tags"),
+    )
+    row = read_manifest(prepared / MANIFEST_NAME)[0]
+    assert row["caption"] == (
+        "iztli, anthro, blue_eyes, looking_at_viewer"
+    )
+    assert row["tags"] == ["anthro", "blue_eyes", "looking_at_viewer"]
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, trigger="iztli", prompt_type="natural"),
+    )
+    row = read_manifest(prepared / MANIFEST_NAME)[0]
+    assert row["caption"] == (
+        "iztli, anthro, blue eyes, looking at viewer"
+    )
+    assert row["tags"] == ["anthro", "blue eyes", "looking at viewer"]
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, trigger="iztli", prompt_type="caption"),
+    )
+    row = read_manifest(prepared / MANIFEST_NAME)[0]
+    assert row["caption"] == (
+        "iztli. An anthropomorphic character with blue eyes looks at the viewer."
+    )
+    assert row["tags"] == ["anthro", "blue eyes", "looking at viewer"]
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, trigger="iztli", prompt_type="all"),
+    )
+    row = read_manifest(prepared / MANIFEST_NAME)[0]
+    assert row["caption"] == (
+        "iztli, anthro, blue_eyes, looking_at_viewer. "
+        "iztli, anthro, blue eyes, looking at viewer. "
+        "iztli. An anthropomorphic character with blue eyes looks at the viewer."
+    )
+    assert row["tags"] == ["anthro", "blue_eyes", "blue eyes", "looking_at_viewer", "looking at viewer"]
+
+
+def test_prepare_caption_prompt_type_falls_back_to_natural_tags(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "item", tags=["blue_eyes"])
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "item")
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, prompt_type="caption"),
+    )
+
+    assert read_manifest(prepared / MANIFEST_NAME)[0]["caption"] == "blue eyes"
 
 
 def test_prepare_flattens_six2one_tag_categories(tmp_path):
@@ -384,16 +941,39 @@ def test_models_list_resolve_remove_search_and_fetch(tmp_path, monkeypatch):
             assert (search, pipeline_tag, limit) == ("fox", "text-to-image", 1)
             return [FakeModel()]
 
-    def fake_snapshot_download(*, repo_id, local_dir):
-        local_dir.mkdir(parents=True)
-        (local_dir / "model_index.json").write_text("{}", encoding="utf-8")
+        def list_repo_files(self, *, repo_id):
+            assert repo_id == "owner/new-model"
+            return ["model.safetensors", "README.md"]
+
+    def fake_hf_hub_download(*, repo_id, filename, cache_dir):
+        assert repo_id == "owner/new-model"
+        assert filename == "model.safetensors"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        source = cache_dir / filename
+        source.write_bytes(b"model")
+        return source
 
     monkeypatch.setattr(models_module, "HfApi", FakeApi)
-    monkeypatch.setattr(models_module, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(models_module, "hf_hub_download", fake_hf_hub_download)
 
     assert project.models.search("fox", limit=1)[0]["model_id"] == "owner/model"
-    assert project.models.fetch("owner/new-model").name == "new-model"
+    assert project.models.fetch("owner/new-model").name == "model.safetensors"
     assert project.models.remove("pony").name == "pony.ckpt"
+
+
+def test_models_fetch_rejects_multiple_safetensors_when_not_interactive(tmp_path, monkeypatch):
+    paths = Paths(tmp_path / "data")
+    project = Project(paths.root)
+
+    class FakeApi:
+        def list_repo_files(self, *, repo_id):
+            assert repo_id == "owner/multi"
+            return ["a.safetensors", "b.safetensors"]
+
+    monkeypatch.setattr(models_module, "HfApi", FakeApi)
+
+    with pytest.raises(ModelAmbiguous, match="Multiple .safetensors files"):
+        project.models.fetch("owner/multi")
 
 
 def test_clip_text_model_compatibility_patch_removed():
@@ -521,7 +1101,7 @@ def test_importer_imports_pairs_skips_existing_and_reports_missing_binary(tmp_pa
             "post_id": 1,
             "source": "e621",
         },
-        "tags": ["anthro", "solo", "fox", "artist_name", "hi_res"],
+        "tags": ["anthro", "solo", "hi_res"],
     }
 
     second = six2one.import_pairs(paths, source)
@@ -547,39 +1127,110 @@ def test_importer_overwrite_replaces_existing_files(tmp_path):
     assert sorted(path.name for path in result.imported) == ["0001.json", "0001.png"]
     assert json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))[
         "tags"
-    ] == ["new", "fox", "artist_name", "hi_res"]
-
+    ] == ["new", "hi_res"]
 
 def test_importer_run_shells_out_and_copies_results(tmp_path, monkeypatch):
     paths = Paths(tmp_path / "data")
+    monkeypatch.setattr(six2one.Path, "home", lambda: tmp_path)
 
     def fake_run(command, *, check):
         out_dir = Path(command[-1])
-        _image(out_dir / "0001.png")
-        _six2one_metadata(out_dir / "0001.json", post_id=1)
+        image_dir = out_dir / "images"
+        post_dir = out_dir / "posts"
+        _image(image_dir / "000000000001.png")
+        _six2one_metadata(post_dir / "000000000001.json", post_id=1)
 
     monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
     result = six2one.run(paths, ["fox", "--safe"], overwrite=False)
 
-    assert sorted(path.name for path in result.imported) == ["0001.json", "0001.png"]
+    assert sorted(path.name for path in result.imported) == ["000000000001.json", "000000000001.png"]
+
+
+def test_importer_run_uses_persistent_621_cache_and_merge(tmp_path, monkeypatch):
+    paths = Paths(tmp_path / "data")
+    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
+    monkeypatch.setattr(six2one.Path, "home", lambda: tmp_path)
+
+    captured: dict[str, list[str] | Path] = {}
+
+    def fake_run(command, *, check):
+        captured["command"] = command
+        out_index = command.index("--out") + 1
+        out_dir = Path(command[out_index])
+        image_dir = out_dir / "images"
+        post_dir = out_dir / "posts"
+        _image(image_dir / "000000000001.png")
+        _six2one_metadata(post_dir / "000000000001.json", post_id=1)
+
+    monkeypatch.setattr(six2one.subprocess, "run", fake_run)
+
+    result = six2one.run(paths, ["fox"], overwrite=False)
+
+    assert "--merge" in captured["command"]
+    assert "--out" in captured["command"]
+    assert captured["command"][captured["command"].index("--out") + 1] == str(
+        tmp_path / ".lorakit" / "cache" / "621"
+    )
+    assert sorted(path.name for path in result.imported) == ["000000000001.json", "000000000001.png"]
+
+
+def test_importer_run_imports_only_new_persistent_cache_pairs(tmp_path, monkeypatch):
+    paths = Paths(tmp_path / "data")
+    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
+    monkeypatch.setattr(six2one.Path, "home", lambda: tmp_path)
+
+    cache_dir = tmp_path / ".lorakit" / "cache" / "621"
+    image_dir = cache_dir / "images"
+    post_dir = cache_dir / "posts"
+    image_dir.mkdir(parents=True)
+    post_dir.mkdir(parents=True)
+    _image(image_dir / "000000000001.png")
+    _six2one_metadata(post_dir / "000000000001.json", post_id=1)
+
+    manifest_path = cache_dir / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(six2one, "_load_six2one_manifest", lambda source_dir: {})
+    monkeypatch.setattr(
+        six2one,
+        "_post_ids_for_query",
+        lambda source_dir, args, manifest: {2},
+    )
+
+    def fake_run(command, *, check):
+        out_dir = Path(command[command.index("--out") + 1])
+        image_dir = out_dir / "images"
+        post_dir = out_dir / "posts"
+        _image(image_dir / "000000000002.png")
+        _six2one_metadata(post_dir / "000000000002.json", post_id=2)
+
+    monkeypatch.setattr(six2one.subprocess, "run", fake_run)
+
+    result = six2one.run(paths, ["fox"], overwrite=False)
+
+    assert sorted(path.name for path in result.imported) == ["000000000002.json", "000000000002.png"]
+    assert not (paths.candidates / "000000000001.png").exists()
+    assert not (paths.candidates / "000000000001.json").exists()
 
 
 def test_importer_run_preserves_site_in_candidate_metadata(tmp_path, monkeypatch):
     paths = Paths(tmp_path / "data")
+    monkeypatch.setattr(six2one.Path, "home", lambda: tmp_path)
 
     def fake_run(command, *, check):
         out_dir = Path(command[-1])
-        _image(out_dir / "0001.png")
-        _six2one_metadata(out_dir / "0001.json", post_id=1)
+        image_dir = out_dir / "images"
+        post_dir = out_dir / "posts"
+        _image(image_dir / "000000000001.png")
+        _six2one_metadata(post_dir / "000000000001.json", post_id=1)
 
     monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
     six2one.run(paths, ["fox", "--site", "e926"], overwrite=False)
 
-    metadata = json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))
+    metadata = json.loads((paths.candidates / "000000000001.json").read_text(encoding="utf-8"))
     assert metadata["metadata"]["source"] == "e926"
 
 
@@ -600,7 +1251,8 @@ def test_cli_create_list_json_and_error_paths(tmp_path, capsys):
     data_dir = tmp_path / "data"
     assert main(["--data-dir", str(data_dir), "dataset", "create", "ds"]) == 0
     create_output = capsys.readouterr().out
-    assert f"Created dataset ds at {data_dir / 'staged' / 'ds'}" in create_output
+    assert "created dataset ds" in create_output
+    assert f"path: {data_dir / 'staged' / 'ds'}" in create_output
     assert (
         main(["--data-dir", str(data_dir), "--output", "json", "dataset", "list"])
         == 0
@@ -631,6 +1283,7 @@ def test_cli_accepts_data_dir_at_command_levels(tmp_path, capsys):
 
 def test_cli_import_extracts_trailing_data_dir_from_importer_args(tmp_path, monkeypatch):
     data_dir = tmp_path / "import-data"
+    monkeypatch.setattr(six2one.Path, "home", lambda: tmp_path)
 
     def fake_run(command, *, check):
         out_dir = Path(command[-1])
@@ -646,13 +1299,13 @@ def test_cli_import_extracts_trailing_data_dir_from_importer_args(tmp_path, monk
     assert (data_dir / "candidates" / "0001.json").exists()
 
 
-def test_cli_candidates_tag_uses_command_options(tmp_path, monkeypatch, capsys):
+def test_cli_candidates_caption_uses_command_options(tmp_path, monkeypatch, capsys):
     data_dir = tmp_path / "data"
     paths = Paths(data_dir)
     _candidate(paths, "0001", tags=["existing"])
 
-    def fake_build_tagger(*, natural):
-        assert natural is True
+    def fake_build_tagger(*, presets):
+        assert presets == ["natural_language"]
         return FakeTagger(["new"])
 
     monkeypatch.setattr(candidates_module, "build_tagger", fake_build_tagger)
@@ -661,23 +1314,70 @@ def test_cli_candidates_tag_uses_command_options(tmp_path, monkeypatch, capsys):
         main(
             [
                 "candidates",
-                "tag",
+                "caption",
                 "--data-dir",
                 str(data_dir),
                 "--all",
-                "--natural",
+                "--preset",
+                "natural_language",
                 "--limit",
                 "1",
+                "--quiet",
             ]
         )
         == 0
     )
     output = capsys.readouterr().out
 
-    assert "Tagged:  1" in output
+    assert "captioned: 1" in output
     assert json.loads((paths.candidates / "0001.json").read_text(encoding="utf-8"))[
         "tags"
     ] == ["existing", "new"]
+
+
+def test_cli_candidates_caption_quiet_disables_progress(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    paths = Paths(data_dir)
+    _candidate(paths, "0001", tags=["existing"])
+    captured: dict[str, object] = {}
+
+    def fake_caption(self, *, all_images, presets, limit, quiet):
+        captured.update(
+            {
+                "all_images": all_images,
+                "presets": presets,
+                "limit": limit,
+                "quiet": quiet,
+            }
+        )
+        return []
+
+    monkeypatch.setattr(Project(data_dir).candidates.__class__, "caption", fake_caption)
+
+    assert (
+        main(
+            [
+                "candidates",
+                "caption",
+                "--data-dir",
+                str(data_dir),
+                "--all",
+                "--preset",
+                "natural_language",
+                "--limit",
+                "1",
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+
+    assert captured == {
+        "all_images": True,
+        "presets": ["natural_language"],
+        "limit": 1,
+        "quiet": True,
+    }
 
 
 def test_cli_dataset_stage_all(tmp_path, capsys):
@@ -809,6 +1509,30 @@ def test_cli_copy_mode_without_dimensions_preserves_original_size(tmp_path):
 
     assert code == 0
     assert _image_size(paths.prepared_for("ds") / "images" / "0001.png") == (64, 32)
+
+
+def test_cli_prepare_accepts_no_remove_watermarks(tmp_path):
+    data_dir = tmp_path / "data"
+    paths = Paths(data_dir)
+    _candidate(paths, "0001", size=(64, 32))
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "0001")
+
+    code = main(
+        [
+            "--data-dir",
+            str(data_dir),
+            "dataset",
+            "prepare",
+            "ds",
+            "--no-remove-watermarks",
+        ]
+    )
+
+    assert code == 0
+    config = json.loads((paths.prepared_for("ds") / "config.json").read_text(encoding="utf-8"))
+    assert config["remove_watermarks"] is False
 
 
 def test_cli_train_dry_run_prints_plan(tmp_path, capsys):
@@ -1015,9 +1739,84 @@ def _six2one_metadata(
 class FakeTagger:
     def __init__(self, tags):
         self._tags = tags
+        self.contexts = []
 
-    def tags_for(self, image_path):
+    def tags_for(self, image_path, *, context_tags=None):
+        self.contexts.append(list(context_tags or []))
         return list(self._tags)
+
+
+class FakeStructuredTagger:
+    def __init__(self, result):
+        self._result = result
+
+    def results_for_many(self, requests):
+        return [self._result for _ in requests]
+
+
+class FakeIterativeStructuredTagger:
+    def __init__(self, metadata_dir):
+        self._metadata_dir = metadata_dir
+        self.first_saved_before_second = False
+
+    def results_for_many_iteratively(self, requests, *, quiet, on_result):
+        results = []
+        for index, request in enumerate(requests):
+            if index == 1:
+                self.first_saved_before_second = (
+                    "tag-0"
+                    in json.loads(
+                        (self._metadata_dir / "0001.json").read_text(encoding="utf-8")
+                    )["tags"]
+                )
+            result = tagging_module.TaggingResult(
+                tags=[f"tag-{index}"],
+                caption=f"Caption {index}.",
+                sidecar={"index": index},
+            )
+            results.append(result)
+            on_result(index, result)
+        return results
+
+
+class FakeTorchModule:
+    class cuda:
+        @staticmethod
+        def is_available():
+            return False
+
+    class inference_mode:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+
+class FakeQwenInputs(dict):
+    def __init__(self):
+        super().__init__(input_ids=[[1, 2]])
+        self.input_ids = [[1, 2]]
+
+    def to(self, device):
+        self.device = device
+        return self
+
+
+class FakeQwenProcessor:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        return "chat"
+
+    def __call__(self, *, text, images, videos, padding, return_tensors):
+        return FakeQwenInputs()
+
+    def batch_decode(self, trimmed, *, skip_special_tokens, clean_up_tokenization_spaces):
+        return ["{}"]
+
+
+class FakeGenerateModel:
+    def generate(self, **kwargs):
+        return [[1, 2, 3]]
 
 
 def _image_size(path: Path) -> tuple[int, int]:

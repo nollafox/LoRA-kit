@@ -45,6 +45,8 @@ class PrepareConfig:
     height: int | None = 512
     image_format: Literal["png", "jpg", "webp", "original"] = "original"
     trigger: str = ""
+    prompt_type: Literal["tags", "natural", "caption", "all"] = "all"
+    remove_watermarks: bool = True
 
 
 @dataclass(frozen=True)

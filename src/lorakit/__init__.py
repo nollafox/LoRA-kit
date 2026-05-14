@@ -11,6 +11,7 @@ import lorakit.importers as importers_module
 import lorakit.models as models_module
 import lorakit.prepare as prepare_module
 import lorakit.training as training_module
+from lorakit.config import ProjectConfig, default_config, discover_config
 from lorakit.errors import ImporterMissing
 from lorakit.paths import Paths
 from lorakit.types import (
@@ -31,12 +32,41 @@ from lorakit.types import (
 class Project:
     """Facade for working with a lorakit data directory."""
 
-    def __init__(self, data_dir: str | Path = "./data"):
-        self.paths = Paths(Path(data_dir))
+    def __init__(
+        self,
+        data_dir: str | Path = "./data",
+        *,
+        config: ProjectConfig | None = None,
+    ):
+        legacy_data_dir = config is None
+        active_config = config
+        if active_config is None:
+            root = Path(data_dir).expanduser().resolve()
+            active_config = ProjectConfig(
+                name=root.parent.name,
+                root=root.parent,
+                data_dir=root,
+                models_dir=root.parent / "models",
+                huggingface_cache_dir=root.parent / "models" / "cache",
+            )
+        self.config = active_config
+        self.paths = Paths(
+            active_config.data_dir,
+            project_directory=active_config.root,
+            models_directory=active_config.models_dir,
+            huggingface_cache_directory=active_config.huggingface_cache_dir,
+        )
         self.paths.ensure()
+        if legacy_data_dir:
+            self.paths.ensure_models()
         self.candidates = _Candidates(self.paths)
         self.datasets = _Datasets(self.paths)
         self.models = _Models(self.paths)
+
+    @classmethod
+    def from_current(cls, start: str | Path | None = None) -> "Project":
+        config = discover_config(Path(start) if start is not None else None)
+        return cls(config=default_config() if config is None else config)
 
     def clean(self, *, apply: bool = False) -> CleanResult:
         return clean_module.clean(self.paths, apply=apply)
@@ -74,14 +104,31 @@ class _Candidates:
         self,
         *,
         all_images: bool = False,
-        natural: bool = False,
+        presets: list[str] | tuple[str, ...] | None = None,
         limit: int | None = None,
+        quiet: bool = False,
     ) -> list[TagResult]:
         return candidates_module.tag(
             self._paths,
             all_images=all_images,
-            natural=natural,
+            presets=presets,
             limit=limit,
+            quiet=quiet,
+        )
+
+    def caption(
+        self,
+        *,
+        all_images: bool = False,
+        presets: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+        quiet: bool = False,
+    ) -> list[TagResult]:
+        return self.tag(
+            all_images=all_images,
+            presets=presets,
+            limit=limit,
+            quiet=quiet,
         )
 
 
@@ -141,6 +188,9 @@ class _Models:
 
     def resolve(self, model: str) -> ModelResolution:
         return models_module.resolve(self._paths, model)
+
+    def install(self, *, with_models: bool = False) -> Path:
+        return models_module.install(self._paths, with_models=with_models)
 
 
 __all__ = [

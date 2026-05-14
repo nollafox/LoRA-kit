@@ -1,16 +1,19 @@
 """Build training-ready prepared datasets."""
 
 import shutil
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
 from PIL import Image, ImageOps
+from tqdm.auto import tqdm
 
 import lorakit.candidates as candidates
 import lorakit.datasets as datasets
 from lorakit.errors import InvalidPrepareConfig, LorakitError
 from lorakit.manifest import MANIFEST_NAME, build_manifest_entry, write_json, write_manifest
 from lorakit.paths import Paths
+from lorakit.tools.watermark import WatermarkRemover, build_watermark_remover
 from lorakit.types import PrepareConfig
 
 
@@ -33,22 +36,32 @@ def prepare(paths: Paths, dataset: str, config: PrepareConfig) -> Path:
         shutil.rmtree(prepared_dir)
     images_dir = prepared_dir / "images"
     images_dir.mkdir(parents=True)
+    watermark_remover = (
+        build_watermark_remover(
+            models_dir=paths.models,
+            cache_dir=paths.huggingface_cache,
+            allow_download=False,
+        )
+        if config.remove_watermarks and len(staged_images) > 0
+        else None
+    )
 
     rows: list[dict[str, object]] = []
     target_names: set[str] = set()
-    for source in staged_images:
+    for source in tqdm(staged_images, desc="Preparing", unit="image"):
         metadata_path = datasets.require_metadata(paths, dataset, source.stem)
         target = images_dir / _prepared_filename(source, config)
         if target.name in target_names:
             raise LorakitError(f"Prepared image filename collision: {target.name}")
         target_names.add(target.name)
-        _prepare_image(source, target, config)
+        _prepare_image(source, target, config, watermark_remover)
         rows.append(
             build_manifest_entry(
                 image_path=target,
                 metadata_path=metadata_path,
                 prepared_root=prepared_dir,
                 trigger=config.trigger,
+                prompt_type=config.prompt_type,
             )
         )
 
@@ -62,6 +75,8 @@ def _validate_config(config: PrepareConfig) -> None:
         raise InvalidPrepareConfig(f"Unsupported prepare mode: {config.mode}")
     if config.image_format not in {"original", "png", "jpg", "webp"}:
         raise InvalidPrepareConfig(f"Unsupported image format: {config.image_format}")
+    if config.prompt_type not in {"tags", "natural", "caption", "all"}:
+        raise InvalidPrepareConfig(f"Unsupported prompt type: {config.prompt_type}")
     if config.mode == "copy" and config.image_format != "original":
         raise InvalidPrepareConfig("copy mode requires image_format='original'")
     if config.mode == "copy" and (config.width is not None or config.height is not None):
@@ -79,7 +94,15 @@ def _prepared_filename(source: Path, config: PrepareConfig) -> str:
     return f"{source.stem}{FORMAT_EXTENSIONS[config.image_format]}"
 
 
-def _prepare_image(source: Path, target: Path, config: PrepareConfig) -> None:
+def _prepare_image(
+    source: Path,
+    target: Path,
+    config: PrepareConfig,
+    watermark_remover: WatermarkRemover | None,
+) -> None:
+    if watermark_remover is not None:
+        _prepare_watermark_cleaned_image(source, target, config, watermark_remover)
+        return
     if config.mode == "copy":
         shutil.copy2(source, target)
         return
@@ -92,6 +115,21 @@ def _prepare_image(source: Path, target: Path, config: PrepareConfig) -> None:
         if save_format == "JPEG" and output.mode != "RGB":
             output = output.convert("RGB")
         output.save(target, format=save_format)
+
+
+def _prepare_watermark_cleaned_image(
+    source: Path,
+    target: Path,
+    config: PrepareConfig,
+    watermark_remover: WatermarkRemover,
+) -> None:
+    if config.mode == "copy":
+        watermark_remover.process_file(source, target)
+        return
+    with tempfile.TemporaryDirectory(prefix="lorakit-watermark-") as temporary_directory:
+        cleaned = Path(temporary_directory) / source.name
+        watermark_remover.process_file(source, cleaned)
+        _prepare_image(cleaned, target, config, None)
 
 
 def _transform_image(image: Image.Image, config: PrepareConfig) -> Image.Image:

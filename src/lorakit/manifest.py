@@ -73,20 +73,68 @@ def build_manifest_entry(
     metadata_path: Path,
     prepared_root: Path,
     trigger: str = "",
+    prompt_type: str = "all",
 ) -> dict[str, Any]:
     metadata = load_metadata(metadata_path)
     if "tags" not in metadata:
         raise MissingMetadata(f"Metadata is missing required 'tags': {metadata_path}")
-    tags = expand_underscore_tags(normalize_tags(metadata["tags"], metadata_path))
-    if trigger:
-        tags.insert(0, trigger)
+    raw_tags = normalize_tags(metadata["tags"], metadata_path)
+    
+    if prompt_type == "tags":
+        tags = raw_tags
+    elif prompt_type in {"natural", "caption"}:
+        tags = [_naturalize_tag(tag) for tag in raw_tags]
+    else:  # "all"
+        tags = expand_underscore_tags(raw_tags)
 
     relative_image = image_path.relative_to(prepared_root).as_posix()
     return {
         "image": relative_image,
-        "caption": ", ".join(tags),
+        "caption": build_prompt(
+            tags=raw_tags,
+            caption=metadata.get("caption"),
+            trigger=trigger,
+            prompt_type=prompt_type,
+        ),
         "tags": tags,
     }
+
+
+def build_prompt(
+    *,
+    tags: list[str],
+    caption: Any,
+    trigger: str = "",
+    prompt_type: str = "all",
+) -> str:
+    if prompt_type not in {"tags", "natural", "caption", "all"}:
+        raise MissingMetadata(f"Unsupported prompt_type: {prompt_type}")
+    tag_values = [trigger, *tags] if trigger else list(tags)
+    raw = ", ".join(tag_values)
+    natural = ", ".join(_naturalize_tag(tag) for tag in tag_values)
+    caption_text = caption.strip() if isinstance(caption, str) else ""
+    if prompt_type == "tags":
+        return raw
+    if prompt_type == "natural":
+        return natural
+    if prompt_type == "caption":
+        if caption_text:
+            return _caption_with_trigger(caption_text, trigger)
+        return natural
+    parts = [raw, natural]
+    if caption_text:
+        parts.append(_caption_with_trigger(caption_text, trigger))
+    return ". ".join(part for part in parts if part)
+
+
+def _naturalize_tag(tag: str) -> str:
+    return tag.replace("_", " ")
+
+
+def _caption_with_trigger(caption: str, trigger: str) -> str:
+    if not trigger:
+        return caption
+    return f"{trigger}. {caption}"
 
 
 def normalize_tags(tags_value: Any, metadata_path: Path) -> list[str]:
