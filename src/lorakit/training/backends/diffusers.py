@@ -1,5 +1,6 @@
 """Diffusers LoRA training backend."""
 
+import copy
 import gc
 import hashlib
 import json
@@ -27,10 +28,12 @@ from lorakit.manifest import MANIFEST_NAME, read_manifest
 from lorakit.training.backends.types import BackendResult, BackendSpec
 from lorakit.training.certified_stepper import (
     candidate_first_order_summaries,
+    certificate_to_log_dict,
     certify_losses,
     denoising_loss_per_example,
     probe_from_context_losses,
     probe_to_log_dict,
+    select_preferred_candidate,
     trainable_parameters as certified_trainable_parameters,
     weighted_gradient,
 )
@@ -50,6 +53,7 @@ PROBE_INITIAL_STEPS: Final = 3
 PROBE_EVERY_STEPS: Final = 25
 PROBE_MIN_FREE_CUDA_BYTES: Final = 500_000_000
 PROBE_WINDOW_TARGET_ITEMS: Final = 4
+PROBE_VERSION: Final = 4
 HASH_CHUNK_SIZE_BYTES: Final = 1024 * 1024
 
 
@@ -208,6 +212,11 @@ def train(spec: BackendSpec) -> BackendResult:
                 )
                 loss = loss_context.loss
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        [parameter for parameter in unet.parameters() if parameter.requires_grad],
+                        MAX_GRAD_NORM,
+                    )
                 should_probe = _should_probe_contexts(
                     global_step=global_step,
                     sync_gradients=accelerator.sync_gradients,
@@ -225,7 +234,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             else None
                         ),
                         extra={
-                            "probe_version": 3,
+                            "probe_version": PROBE_VERSION,
                             "microbatch_size": int(loss_context.noise.shape[0]),
                             "requested_batch_size": int(spec.batch_size),
                             "gradient_accumulation": int(spec.gradient_accumulation),
@@ -234,6 +243,7 @@ def train(spec: BackendSpec) -> BackendResult:
                     try:
                         _write_streaming_context_probe_if_main(
                             unet=unet,
+                            optimizer=optimizer,
                             dataset=dataset,
                             batch=batch,
                             noise_scheduler=noise_scheduler,
@@ -260,7 +270,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             status="skipped_cuda_oom",
                             free_cuda_bytes=_cuda_free_bytes(),
                             extra={
-                                "probe_version": 3,
+                                "probe_version": PROBE_VERSION,
                                 "requested_batch_size": int(spec.batch_size),
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
@@ -275,16 +285,11 @@ def train(spec: BackendSpec) -> BackendResult:
                             status="skipped_low_cuda_memory",
                             free_cuda_bytes=free_cuda_bytes,
                             extra={
-                                "probe_version": 3,
+                                "probe_version": PROBE_VERSION,
                                 "requested_batch_size": int(spec.batch_size),
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
                         )
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        [parameter for parameter in unet.parameters() if parameter.requires_grad],
-                        MAX_GRAD_NORM,
-                    )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1024,7 +1029,7 @@ def _probe_extra_metadata(
     window_snr = torch.tensor(window_snr_values, dtype=torch.float32)
 
     return {
-        "probe_version": 3,
+        "probe_version": PROBE_VERSION,
         "microbatch_size": int(latents.shape[0]),
         "requested_batch_size": int(requested_batch_size),
         "gradient_accumulation": int(gradient_accumulation),
@@ -1094,6 +1099,7 @@ def _write_probe_status_if_main(
 def _write_streaming_context_probe_if_main(
     *,
     unet: UNet2DConditionModel,
+    optimizer,
     dataset: _DiskCachedLatentDataset,
     batch: dict[str, object],
     noise_scheduler: DDPMScheduler,
@@ -1156,8 +1162,9 @@ def _write_streaming_context_probe_if_main(
         mgda_weights=probe.mgda_lambda,
         context_counts=context_counts,
     )
-    candidate_certificates = _candidate_step_certificates_for_probe_window(
+    candidate_certificates, candidate_selection = _candidate_step_certificates_for_probe_window(
         unet=unet,
+        optimizer=optimizer,
         parameters=parameters,
         probe_batches=probe_batches,
         noise_scheduler=noise_scheduler,
@@ -1184,6 +1191,7 @@ def _write_streaming_context_probe_if_main(
             "candidate_step_size": float(candidate_step_size),
             "candidate_first_order": first_order,
             "candidate_certificates": candidate_certificates,
+            "candidate_selection": candidate_selection,
         }
     )
 
@@ -1366,6 +1374,7 @@ def _candidate_gradients_from_probe(
 def _candidate_step_certificates_for_probe_window(
     *,
     unet: UNet2DConditionModel,
+    optimizer,
     parameters: list[torch.nn.Parameter],
     probe_batches: list[_ProbeBatch],
     noise_scheduler: DDPMScheduler,
@@ -1374,13 +1383,53 @@ def _candidate_step_certificates_for_probe_window(
     old_context_losses: torch.Tensor,
     candidate_gradients: dict[str, torch.Tensor],
     step_size: float,
-) -> dict[str, object]:
-    snapshot = _snapshot_trainable_parameters(parameters)
+) -> tuple[dict[str, object], dict[str, object]]:
+    parameter_snapshot = _snapshot_trainable_parameters(parameters)
+    gradient_snapshot = _snapshot_trainable_gradients(parameters)
+    optimizer_snapshot = _snapshot_optimizer_state(optimizer)
+
+    certificate_objects = {}
     results: dict[str, object] = {}
+    update_norms: dict[str, float] = {}
 
     try:
+        if optimizer_snapshot is not None:
+            _restore_trainable_parameters(parameters, parameter_snapshot)
+            _restore_trainable_gradients(parameters, gradient_snapshot)
+            _restore_optimizer_state(optimizer, optimizer_snapshot)
+            before = _flatten_trainable_parameters(parameters)
+            optimizer.step()
+            after = _flatten_trainable_parameters(parameters)
+            update_norms["adamw_actual"] = float(torch.linalg.vector_norm(after - before).item())
+            with torch.no_grad():
+                new_context_losses = _evaluate_probe_context_losses(
+                    probe_batches=probe_batches,
+                    unet=unet,
+                    noise_scheduler=noise_scheduler,
+                    weight_dtype=weight_dtype,
+                    context_ids=context_ids,
+                )
+            certificate = certify_losses(
+                old_context_losses=old_context_losses,
+                new_context_losses=new_context_losses,
+                backtracks=0,
+                step_size=step_size,
+                context_ids=context_ids,
+            )
+            certificate_objects["adamw_actual"] = certificate
+            results["adamw_actual"] = certificate_to_log_dict(certificate)
+        else:
+            results["adamw_actual"] = {
+                "available": False,
+                "reason": "optimizer_state_snapshot_unavailable",
+            }
+
         for name, flat_gradient in candidate_gradients.items():
-            _restore_trainable_parameters(parameters, snapshot)
+            _restore_trainable_parameters(parameters, parameter_snapshot)
+            _restore_trainable_gradients(parameters, gradient_snapshot)
+            if optimizer_snapshot is not None:
+                _restore_optimizer_state(optimizer, optimizer_snapshot)
+            update_norms[name] = float(torch.linalg.vector_norm(flat_gradient.detach().float().cpu()).item())
             _apply_flat_gradient_step(
                 parameters=parameters,
                 flat_gradient=flat_gradient,
@@ -1399,31 +1448,28 @@ def _candidate_step_certificates_for_probe_window(
                 new_context_losses=new_context_losses,
                 backtracks=0,
                 step_size=step_size,
+                context_ids=context_ids,
             )
-            deltas = (new_context_losses - old_context_losses.detach().float().cpu()).detach().float().cpu()
-            worsened = [
-                int(context_id)
-                for context_id, delta in zip(context_ids, deltas.tolist(), strict=True)
-                if float(delta) > 1e-8
-            ]
-            results[name] = {
-                "accepted": bool(certificate.accepted),
-                "reason": certificate.reason,
-                "old_mean_loss": float(certificate.old_mean_loss),
-                "new_mean_loss": float(certificate.new_mean_loss),
-                "old_max_loss": float(certificate.old_max_loss),
-                "new_max_loss": float(certificate.new_max_loss),
-                "mean_delta": float(certificate.mean_delta),
-                "max_delta": float(certificate.max_delta),
-                "step_size": float(certificate.step_size),
-                "context_deltas": [float(value) for value in deltas.tolist()],
-                "worsened_context_ids": worsened,
-            }
+            certificate_objects[name] = certificate
+            results[name] = certificate_to_log_dict(certificate)
     finally:
-        _restore_trainable_parameters(parameters, snapshot)
+        _restore_trainable_parameters(parameters, parameter_snapshot)
+        _restore_trainable_gradients(parameters, gradient_snapshot)
+        if optimizer_snapshot is not None:
+            _restore_optimizer_state(optimizer, optimizer_snapshot)
 
-    return results
+    selection = select_preferred_candidate(
+        certificate_objects,
+        update_norms=update_norms,
+    )
+    selection["committed_update"] = "adamw_actual"
+    selection["selection_is_instrumentation_only"] = True
+    selection["update_norms"] = {
+        name: float(value)
+        for name, value in update_norms.items()
+    }
 
+    return results, selection
 
 def _evaluate_probe_context_losses(
     *,
@@ -1461,6 +1507,47 @@ def _evaluate_probe_context_losses(
             raise LorakitError(f"Probe context disappeared during candidate evaluation: {context_id}")
         losses.append(loss_sums[context_id] / float(counts[context_id]))
     return torch.stack(losses)
+
+
+def _flatten_trainable_parameters(
+    parameters: list[torch.nn.Parameter],
+) -> torch.Tensor:
+    pieces = [parameter.detach().float().reshape(-1).cpu() for parameter in parameters]
+    if not pieces:
+        raise LorakitError("No trainable parameters found for candidate evaluation")
+    return torch.cat(pieces, dim=0)
+
+
+def _snapshot_trainable_gradients(
+    parameters: list[torch.nn.Parameter],
+) -> list[torch.Tensor | None]:
+    return [
+        None if parameter.grad is None else parameter.grad.detach().clone()
+        for parameter in parameters
+    ]
+
+
+@torch.no_grad()
+def _restore_trainable_gradients(
+    parameters: list[torch.nn.Parameter],
+    snapshot: list[torch.Tensor | None],
+) -> None:
+    for parameter, value in zip(parameters, snapshot, strict=True):
+        if value is None:
+            parameter.grad = None
+        else:
+            parameter.grad = value.detach().clone().to(device=parameter.device)
+
+
+def _snapshot_optimizer_state(optimizer):
+    try:
+        return copy.deepcopy(optimizer.state_dict())
+    except Exception:
+        return None
+
+
+def _restore_optimizer_state(optimizer, snapshot) -> None:
+    optimizer.load_state_dict(copy.deepcopy(snapshot))
 
 
 def _snapshot_trainable_parameters(

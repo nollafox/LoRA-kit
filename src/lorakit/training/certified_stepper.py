@@ -43,6 +43,11 @@ class ContextProbe:
 @dataclass(frozen=True)
 class StepCertificate:
     accepted: bool
+    accepted_strict: bool
+    accepted_tolerant: bool
+    accepted_strong: bool
+    accepted_bottleneck: bool
+    acceptance_level: str
     reason: str
     old_mean_loss: float
     new_mean_loss: float
@@ -52,6 +57,9 @@ class StepCertificate:
     max_delta: float
     backtracks: int
     step_size: float
+    certificate_tolerance: float
+    context_deltas: tuple[float, ...]
+    worsened_context_ids: tuple[int, ...]
 
 
 def denoising_loss_per_example(
@@ -510,30 +518,178 @@ def weighted_context_loss(
     return torch.sum(weights.to(device=context_losses.device, dtype=context_losses.dtype) * context_losses)
 
 
+def adaptive_certificate_tolerance(
+    context_losses: torch.Tensor,
+    *,
+    absolute_floor: float = 1e-7,
+    relative: float = 1e-5,
+) -> float:
+    """Return a scale-aware tolerance for frozen-probe candidate certificates."""
+    losses = context_losses.detach().float().cpu()
+    if losses.numel() == 0:
+        raise ValueError("context_losses cannot be empty")
+    scale = max(float(losses.mean().item()), float(losses.max().item()), 1.0)
+    return float(max(float(absolute_floor), float(relative) * scale))
+
+
+def _certificate_acceptance_level(
+    *,
+    accepted_strong: bool,
+    accepted_bottleneck: bool,
+) -> str:
+    if accepted_strong:
+        return "strong"
+    if accepted_bottleneck:
+        return "bottleneck"
+    return "reject"
+
+
+def certificate_to_log_dict(certificate: StepCertificate) -> dict[str, object]:
+    return {
+        "accepted": bool(certificate.accepted),
+        "accepted_strict": bool(certificate.accepted_strict),
+        "accepted_tolerant": bool(certificate.accepted_tolerant),
+        "accepted_strong": bool(certificate.accepted_strong),
+        "accepted_bottleneck": bool(certificate.accepted_bottleneck),
+        "acceptance_level": certificate.acceptance_level,
+        "reason": certificate.reason,
+        "old_mean_loss": float(certificate.old_mean_loss),
+        "new_mean_loss": float(certificate.new_mean_loss),
+        "old_max_loss": float(certificate.old_max_loss),
+        "new_max_loss": float(certificate.new_max_loss),
+        "mean_delta": float(certificate.mean_delta),
+        "max_delta": float(certificate.max_delta),
+        "backtracks": int(certificate.backtracks),
+        "step_size": float(certificate.step_size),
+        "certificate_tolerance": float(certificate.certificate_tolerance),
+        "context_deltas": [float(value) for value in certificate.context_deltas],
+        "worsened_context_ids": [int(value) for value in certificate.worsened_context_ids],
+    }
+
+
+def select_preferred_candidate(
+    certificates: dict[str, StepCertificate],
+    *,
+    update_norms: dict[str, float] | None = None,
+) -> dict[str, object]:
+    """Rank candidate certificates without mutating model state.
+
+    Preference order:
+        1. strong certificates
+        2. bottleneck certificates
+        3. lower max-delta
+        4. lower mean-delta
+        5. smaller update norm
+    """
+    if not certificates:
+        return {
+            "selected": None,
+            "reason": "no_candidates",
+            "accepted_candidates": [],
+            "rejected_candidates": [],
+            "would_replace_committed_update": False,
+        }
+
+    level_rank = {"reject": 0, "bottleneck": 1, "strong": 2}
+    norms = update_norms or {}
+
+    def sort_key(item: tuple[str, StepCertificate]) -> tuple[float, float, float, float]:
+        name, cert = item
+        return (
+            -float(level_rank.get(cert.acceptance_level, 0)),
+            float(cert.max_delta),
+            float(cert.mean_delta),
+            float(norms.get(name, 0.0)),
+        )
+
+    ordered = sorted(certificates.items(), key=sort_key)
+    selected_name, selected_cert = ordered[0]
+    accepted = [
+        name
+        for name, cert in certificates.items()
+        if cert.acceptance_level != "reject"
+    ]
+    rejected = [
+        name
+        for name, cert in certificates.items()
+        if cert.acceptance_level == "reject"
+    ]
+
+    return {
+        "selected": selected_name,
+        "reason": (
+            "best_certificate"
+            if selected_cert.acceptance_level != "reject"
+            else "all_candidates_rejected_lowest_damage"
+        ),
+        "selected_acceptance_level": selected_cert.acceptance_level,
+        "accepted_candidates": accepted,
+        "rejected_candidates": rejected,
+        "would_replace_committed_update": selected_name != "adamw_actual",
+    }
+
+
 def certify_losses(
     *,
     old_context_losses: torch.Tensor,
     new_context_losses: torch.Tensor,
     backtracks: int,
     step_size: float,
-    tolerance: float = 1e-8,
+    tolerance: float | None = None,
+    context_ids: Sequence[int] | None = None,
 ) -> StepCertificate:
     old_losses = old_context_losses.detach().float().cpu()
     new_losses = new_context_losses.detach().float().cpu()
     if old_losses.shape != new_losses.shape:
         raise ValueError("old/new context loss shape mismatch")
 
+    if tolerance is None:
+        tolerance = adaptive_certificate_tolerance(old_losses)
+
     old_mean = float(old_losses.mean().item())
     new_mean = float(new_losses.mean().item())
     old_max = float(old_losses.max().item())
     new_max = float(new_losses.max().item())
+    deltas = (new_losses - old_losses).detach().float().cpu()
     mean_delta = new_mean - old_mean
     max_delta = new_max - old_max
-    accepted = max_delta <= tolerance and mean_delta <= tolerance
+
+    accepted_strict = max_delta <= 0.0 and mean_delta <= 0.0
+    accepted_tolerant = max_delta <= tolerance and mean_delta <= tolerance
+    accepted_strong = accepted_tolerant and bool(torch.all(deltas <= float(tolerance)).item())
+    accepted_bottleneck = accepted_tolerant
+    accepted = accepted_bottleneck
+    acceptance_level = _certificate_acceptance_level(
+        accepted_strong=accepted_strong,
+        accepted_bottleneck=accepted_bottleneck,
+    )
+
+    if context_ids is None:
+        context_ids = tuple(range(int(deltas.numel())))
+    if len(context_ids) != int(deltas.numel()):
+        raise ValueError("context_ids length must match context losses")
+
+    worsened = tuple(
+        int(context_id)
+        for context_id, delta in zip(context_ids, deltas.tolist(), strict=True)
+        if float(delta) > float(tolerance)
+    )
+
+    if accepted_strong:
+        reason = "accepted_strong_no_context_worsened"
+    elif accepted_bottleneck:
+        reason = "accepted_bottleneck_mean_and_max_nonworsening"
+    else:
+        reason = "rejected_context_or_mean_increase"
 
     return StepCertificate(
         accepted=accepted,
-        reason="accepted" if accepted else "rejected_context_or_mean_increase",
+        accepted_strict=accepted_strict,
+        accepted_tolerant=accepted_tolerant,
+        accepted_strong=accepted_strong,
+        accepted_bottleneck=accepted_bottleneck,
+        acceptance_level=acceptance_level,
+        reason=reason,
         old_mean_loss=old_mean,
         new_mean_loss=new_mean,
         old_max_loss=old_max,
@@ -542,4 +698,7 @@ def certify_losses(
         max_delta=max_delta,
         backtracks=backtracks,
         step_size=float(step_size),
+        certificate_tolerance=float(tolerance),
+        context_deltas=tuple(float(value) for value in deltas.tolist()),
+        worsened_context_ids=worsened,
     )
