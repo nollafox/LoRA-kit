@@ -253,7 +253,9 @@ The four modes differ in how they handle aspect ratio:
 - `center-crop` crops to the target aspect ratio and then resizes to the target box.
 - `pad` resizes to fit, then pads the remainder to fill the box.
 
-If you supply only one of `--width` or `--height`, `fit` constrains that one dimension; `center-crop` and `pad` mirror it for the missing one; `copy` errors.
+Prepared image dimensions are always normalized to the nearest multiple of 8 before training. If you supply only one of `--width` or `--height`, `fit` constrains that one dimension and derives the other from the image aspect ratio, then normalizes the final size; `center-crop` and `pad` mirror the provided dimension for the missing one. `copy` preserves pixels exactly, so it errors when the source image dimensions are not already divisible by 8.
+
+Prepared images may have different aspect ratios and dimensions. During training, lorakit caches latents per image shape and only batches samples whose latent tensors can be stacked together; gradient accumulation can still combine those compatible microbatches into one optimizer step.
 
 `--image-format original` passes the source format through. `png`, `jpg`, and `webp` convert. Converting a transparent source to `jpg` errors rather than silently flattening — handle transparency at the source, or use a format that supports it.
 

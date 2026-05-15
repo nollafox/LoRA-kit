@@ -1068,7 +1068,7 @@ def test_move_module_to_device_handles_meta_tensors(tmp_path):
     assert moved.param.dtype == torch.float32
 
 
-def test_diffusers_load_rows_rejects_mixed_image_shapes(tmp_path):
+def test_diffusers_load_rows_accepts_mixed_vae_compatible_image_shapes(tmp_path):
     from lorakit.training.backends import diffusers as diffusers_backend
 
     prepared_dir = tmp_path / "prepared"
@@ -1082,7 +1082,22 @@ def test_diffusers_load_rows_rejects_mixed_image_shapes(tmp_path):
         ],
     )
 
-    with pytest.raises(LorakitError, match="must share one tensor shape"):
+    rows = diffusers_backend._load_rows(prepared_dir)
+
+    assert [(row.width, row.height) for row in rows] == [(32, 32), (64, 32)]
+
+
+def test_diffusers_load_rows_rejects_non_vae_compatible_image_shapes(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    prepared_dir = tmp_path / "prepared"
+    _image(prepared_dir / "images" / "bad.png", size=(33, 32))
+    _write_prepared_manifest(
+        prepared_dir,
+        [{"image": "images/bad.png", "caption": "bad", "tags": ["tag"]}],
+    )
+
+    with pytest.raises(LorakitError, match="dimensions must be divisible by 8"):
         diffusers_backend._load_rows(prepared_dir)
 
 
@@ -1110,6 +1125,37 @@ def test_diffusers_disk_cache_dataset_validates_and_loads_tensors(tmp_path):
     item = dataset[0]
     assert tuple(item["latents"].shape) == (4, 8, 8)
     assert tuple(item["encoder_hidden_states"].shape) == (77, 768)
+
+
+def test_diffusers_latent_shape_batch_sampler_never_mixes_shapes(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    records = [
+        _diffusers_cache_record(tmp_path, 0, latent_shape=(4, 8, 8)),
+        _diffusers_cache_record(tmp_path, 1, latent_shape=(4, 8, 8)),
+        _diffusers_cache_record(tmp_path, 2, latent_shape=(4, 4, 8)),
+    ]
+    sampler = diffusers_backend._LatentShapeBatchSampler(records=records, batch_size=2)
+
+    for batch in sampler:
+        shapes = {records[index].latent_shape for index in batch}
+        assert len(shapes) == 1
+
+
+def test_diffusers_pixel_shape_cache_batches_group_compatible_images(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    rows = [
+        diffusers_backend._TrainingRow("a.png", "a", tmp_path / "a.png", "a", 32, 32),
+        diffusers_backend._TrainingRow("b.png", "b", tmp_path / "b.png", "b", 64, 32),
+        diffusers_backend._TrainingRow("c.png", "c", tmp_path / "c.png", "c", 32, 32),
+    ]
+
+    batches = diffusers_backend._pixel_shape_cache_batches(rows)
+
+    for batch in batches:
+        shapes = {(rows[index].width, rows[index].height) for index in batch}
+        assert len(shapes) == 1
 
 
 def test_certified_stepper_projects_to_simplex():
@@ -1913,6 +1959,31 @@ def _write_prepared_manifest(prepared_dir: Path, rows: list[dict[str, object]]) 
     prepared_dir.mkdir(parents=True, exist_ok=True)
     content = "\n".join(json.dumps(row) for row in rows)
     (prepared_dir / MANIFEST_NAME).write_text(f"{content}\n", encoding="utf-8")
+
+
+def _diffusers_cache_record(
+    root: Path,
+    index: int,
+    *,
+    latent_shape: tuple[int, int, int],
+):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    latent_path = root / "latents" / f"{index:08d}.pt"
+    hidden_path = root / "text" / f"{index:08d}.pt"
+    latent_path.parent.mkdir(parents=True, exist_ok=True)
+    hidden_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.zeros(latent_shape), latent_path)
+    torch.save(torch.zeros(77, 768), hidden_path)
+    return diffusers_backend._CacheRecord(
+        image=f"images/{index:08d}.png",
+        caption_sha256=f"caption-{index}",
+        image_sha256=f"image-{index}",
+        latent_path=latent_path,
+        encoder_hidden_state_path=hidden_path,
+        latent_shape=latent_shape,
+        encoder_hidden_state_shape=(77, 768),
+    )
 
 
 def _six2one_metadata(

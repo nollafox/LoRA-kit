@@ -3,6 +3,7 @@
 import gc
 import hashlib
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -12,7 +13,7 @@ from accelerate import Accelerator
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import BatchSampler, DataLoader, Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -158,8 +159,10 @@ def train(spec: BackendSpec) -> BackendResult:
     )
     dataloader = DataLoader(
         dataset,
-        shuffle=True,
-        batch_size=spec.batch_size,
+        batch_sampler=_LatentShapeBatchSampler(
+            records=cache_records,
+            batch_size=spec.batch_size,
+        ),
         collate_fn=_collate_cached,
         num_workers=0,
         pin_memory=False,
@@ -297,6 +300,39 @@ class _DiskCachedLatentDataset(Dataset):
         }
 
 
+class _LatentShapeBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        *,
+        records: list[_CacheRecord],
+        batch_size: int,
+    ):
+        if batch_size <= 0:
+            raise LorakitError("Batch size must be greater than zero")
+        buckets: dict[tuple[int, ...], list[int]] = {}
+        for index, record in enumerate(records):
+            buckets.setdefault(record.latent_shape, []).append(index)
+        if not buckets:
+            raise LorakitError("Tensor cache has no latent-shape buckets")
+        self._buckets = buckets
+        self._batch_size = batch_size
+
+    def __iter__(self):
+        bucket_keys = list(self._buckets)
+        random.shuffle(bucket_keys)
+        for bucket_key in bucket_keys:
+            indices = list(self._buckets[bucket_key])
+            random.shuffle(indices)
+            for start in range(0, len(indices), self._batch_size):
+                yield indices[start : start + self._batch_size]
+
+    def __len__(self) -> int:
+        return sum(
+            (len(indices) + self._batch_size - 1) // self._batch_size
+            for indices in self._buckets.values()
+        )
+
+
 class _Components:
     def __init__(
         self,
@@ -355,7 +391,6 @@ def _load_rows(prepared_dir: Path) -> list[_TrainingRow]:
     if not rows:
         raise LorakitError(f"Prepared dataset has no training rows: {prepared_dir}")
     loaded_rows: list[_TrainingRow] = []
-    expected_size: tuple[int, int] | None = None
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise LorakitError(f"Prepared manifest row {index} must be an object")
@@ -376,14 +411,6 @@ def _load_rows(prepared_dir: Path) -> list[_TrainingRow]:
             raise LorakitError(
                 "Prepared image dimensions must be divisible by "
                 f"{VAE_DOWNSAMPLE_FACTOR}: {image_path} is {width}x{height}"
-            )
-        current_size = (width, height)
-        if expected_size is None:
-            expected_size = current_size
-        elif current_size != expected_size:
-            raise LorakitError(
-                "Prepared images must share one tensor shape for batched training: "
-                f"expected {expected_size[0]}x{expected_size[1]}, got {width}x{height} at {image_path}"
             )
         loaded_rows.append(
             _TrainingRow(
@@ -513,23 +540,34 @@ def _cache_latents(
     vae.to(device=device, dtype=dtype)
     vae.eval()
     cached: list[Path] = []
-    for batch_start in tqdm(
-        range(0, len(rows), CACHE_ENCODING_BATCH_SIZE),
+    for batch_indices in tqdm(
+        _pixel_shape_cache_batches(rows),
         desc="Encoding latents",
     ):
-        batch_rows = rows[batch_start : batch_start + CACHE_ENCODING_BATCH_SIZE]
         pixel_batches: list[torch.Tensor] = []
-        for row in batch_rows:
-            with Image.open(row.image_path) as image:
+        for index in batch_indices:
+            with Image.open(rows[index].image_path) as image:
                 pixel_batches.append(transform(image.convert("RGB")))
         pixel_values = torch.stack(pixel_batches).to(device=device, dtype=dtype)
         latents = vae.encode(pixel_values).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
-        for offset, tensor in enumerate(latents):
-            path = latent_cache_dir / f"{batch_start + offset:08d}.pt"
+        for index, tensor in zip(batch_indices, latents, strict=True):
+            path = latent_cache_dir / f"{index:08d}.pt"
             _save_tensor(path, tensor.detach().to(dtype=dtype).cpu())
             cached.append(path)
+    cached.sort()
     return cached
+
+
+def _pixel_shape_cache_batches(rows: list[_TrainingRow]) -> list[list[int]]:
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for index, row in enumerate(rows):
+        buckets.setdefault((row.width, row.height), []).append(index)
+    batches: list[list[int]] = []
+    for indices in buckets.values():
+        for start in range(0, len(indices), CACHE_ENCODING_BATCH_SIZE):
+            batches.append(indices[start : start + CACHE_ENCODING_BATCH_SIZE])
+    return batches
 
 
 def _cache_records(
@@ -573,11 +611,6 @@ def _assert_cache_records_are_consistent(records: list[_CacheRecord]) -> None:
             raise LorakitError(f"Missing latent cache tensor: {record.latent_path}")
         if not record.encoder_hidden_state_path.exists():
             raise LorakitError(f"Missing text cache tensor: {record.encoder_hidden_state_path}")
-        if record.latent_shape != first.latent_shape:
-            raise LorakitError(
-                "Latent cache tensor shape mismatch: "
-                f"expected {first.latent_shape}, got {record.latent_shape} for {record.image}"
-            )
         if record.encoder_hidden_state_shape != first.encoder_hidden_state_shape:
             raise LorakitError(
                 "Text cache tensor shape mismatch: "
@@ -591,13 +624,14 @@ def _write_cache_manifest(path: Path, records: list[_CacheRecord]) -> None:
     payload = {
         "version": 1,
         "count": len(records),
-        "latent_shape": list(records[0].latent_shape),
+        "latent_shapes": [list(shape) for shape in sorted({record.latent_shape for record in records})],
         "encoder_hidden_state_shape": list(records[0].encoder_hidden_state_shape),
         "records": [
             {
                 "image": record.image,
                 "image_sha256": record.image_sha256,
                 "caption_sha256": record.caption_sha256,
+                "latent_shape": list(record.latent_shape),
                 "latent": str(record.latent_path.relative_to(path.parent)),
                 "encoder_hidden_state": str(
                     record.encoder_hidden_state_path.relative_to(path.parent)
