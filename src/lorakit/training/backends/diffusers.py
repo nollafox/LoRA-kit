@@ -196,6 +196,13 @@ def train(spec: BackendSpec) -> BackendResult:
         disable=not accelerator.is_local_main_process,
     )
     probe_log_path = spec.output_dir / PROBE_LOG_NAME
+    _write_probe_status_if_main(
+        probe_log_path=probe_log_path,
+        step=0,
+        should_log=accelerator.is_local_main_process,
+        status="started",
+        free_cuda_bytes=_cuda_free_bytes(),
+    )
     while global_step < spec.steps:
         for batch in dataloader:
             with accelerator.accumulate(unet):
@@ -277,7 +284,8 @@ def train(spec: BackendSpec) -> BackendResult:
     model_path = spec.output_dir / LORA_WEIGHTS_NAME
     if not model_path.exists():
         raise LorakitError(f"Diffusers backend did not write LoRA weights: {model_path}")
-    return BackendResult(model_path=model_path)
+    artifact_paths = (probe_log_path,) if probe_log_path.exists() else ()
+    return BackendResult(model_path=model_path, artifact_paths=artifact_paths)
 
 
 @dataclass(frozen=True)

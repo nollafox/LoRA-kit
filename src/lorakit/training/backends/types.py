@@ -21,3 +21,4 @@ class BackendSpec:
 @dataclass(frozen=True)
 class BackendResult:
     model_path: Path
+    artifact_paths: tuple[Path, ...] = ()

@@ -1431,7 +1431,12 @@ def test_training_invokes_backend_and_archives_artifacts(tmp_path, monkeypatch):
             spec.output_dir.mkdir(parents=True)
             model_path = spec.output_dir / "pytorch_lora_weights.safetensors"
             model_path.write_bytes(b"lora")
-            return BackendResult(model_path=model_path)
+            probe_log_path = spec.output_dir / "context-probes.jsonl"
+            probe_log_path.write_text('{"step": 0}\n', encoding="utf-8")
+            return BackendResult(
+                model_path=model_path,
+                artifact_paths=(probe_log_path,),
+            )
 
     monkeypatch.setattr(training_module, "get_backend", lambda name: FakeBackend())
 
@@ -1443,6 +1448,8 @@ def test_training_invokes_backend_and_archives_artifacts(tmp_path, monkeypatch):
     assert seen["spec"].model == str(paths.models / "sd15.safetensors")
     assert (result.artifact_dir / "dataset" / MANIFEST_NAME).exists()
     assert (result.artifact_dir / "model.safetensors").read_bytes() == b"lora"
+    assert result.probe_log == result.artifact_dir / "context-probes.jsonl"
+    assert result.probe_log.read_text(encoding="utf-8") == '{"step": 0}\n'
     assert not (result.artifact_dir / "working").exists()
 
 

@@ -57,13 +57,22 @@ def train(paths: Paths, spec: TrainingSpec) -> TrainingResult:
     completed = False
     try:
         backend_result = get_backend(spec.backend).train(backend_spec)
-        _archive_backend_result(prepared_dir, artifact_dir, backend_result.model_path)
+        archived_artifacts = _archive_backend_result(
+            prepared_dir,
+            artifact_dir,
+            backend_result.model_path,
+            backend_result.artifact_paths,
+        )
         completed = True
     finally:
         if not completed and artifact_dir.exists():
             shutil.rmtree(artifact_dir)
 
-    return TrainingResult(artifact_dir=artifact_dir, run_name=run_name)
+    return TrainingResult(
+        artifact_dir=artifact_dir,
+        run_name=run_name,
+        probe_log=archived_artifacts.get("context-probes.jsonl"),
+    )
 
 
 def _next_run_name(paths: Paths, dataset: str) -> str:
@@ -136,12 +145,21 @@ def _archive_backend_result(
     prepared_dir: Path,
     artifact_dir: Path,
     backend_model_path: Path,
-) -> None:
+    backend_artifact_paths: tuple[Path, ...],
+) -> dict[str, Path]:
     if not backend_model_path.exists():
         raise LorakitError(f"Training backend did not produce model file: {backend_model_path}")
     shutil.copytree(prepared_dir, artifact_dir / "dataset")
     shutil.copy2(backend_model_path, artifact_dir / "model.safetensors")
+    archived_artifacts: dict[str, Path] = {}
+    for backend_artifact_path in backend_artifact_paths:
+        if not backend_artifact_path.exists():
+            raise LorakitError(f"Training backend artifact is missing: {backend_artifact_path}")
+        destination = artifact_dir / backend_artifact_path.name
+        shutil.copy2(backend_artifact_path, destination)
+        archived_artifacts[backend_artifact_path.name] = destination
     shutil.rmtree(artifact_dir / "working")
+    return archived_artifacts
 
 
 def _jsonable(value: object) -> object:
