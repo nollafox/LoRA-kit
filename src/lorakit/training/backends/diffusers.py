@@ -51,10 +51,13 @@ VALIDATION_FRACTION: Final = 0.08
 VALIDATION_MAX_ITEMS: Final = 32
 VALIDATION_EVERY_PROBES: Final = 1
 VALIDATION_SNR_BUCKETS: Final = ("high", "mid", "low")
+VALIDATION_SCORE_ABSOLUTE_TOLERANCE: Final = 1e-7
+VALIDATION_SCORE_RELATIVE_TOLERANCE: Final = 1e-5
 CACHE_ENCODING_MAX_BATCH_SIZE: Final = 4
 CACHE_ENCODING_MIN_BATCH_SIZE: Final = 1
 CACHE_DIR_NAME: Final = "tensor-cache"
 CACHE_MANIFEST_NAME: Final = "manifest.json"
+LATENT_CACHE_MODE: Final = "posterior_mode"
 PROBE_LOG_NAME = "context-probes.jsonl"
 PROBE_SUMMARY_NAME = "context-probes-summary.json"
 PROBE_INITIAL_STEPS: Final = 3
@@ -154,6 +157,7 @@ def train(spec: BackendSpec) -> BackendResult:
         device=accelerator.device,
         dtype=weight_dtype,
     )
+    latent_scaling_factor = float(vae.config.scaling_factor)
     text_encoder.to("cpu")
     vae.to("cpu")
     del text_encoder
@@ -172,7 +176,11 @@ def train(spec: BackendSpec) -> BackendResult:
         latent_paths=latent_paths,
         encoder_hidden_state_paths=encoder_hidden_state_paths,
     )
-    _write_cache_manifest(cache_dir / CACHE_MANIFEST_NAME, cache_records)
+    _write_cache_manifest(
+        cache_dir / CACHE_MANIFEST_NAME,
+        cache_records,
+        latent_scaling_factor=latent_scaling_factor,
+    )
     train_records, validation_records = _split_train_validation_records(cache_records)
     validation_skeleton = _build_validation_skeleton(
         records=validation_records,
@@ -180,6 +188,7 @@ def train(spec: BackendSpec) -> BackendResult:
     )
     best_checkpoint = _BestCheckpoint.empty(spec.output_dir / BEST_LORA_WEIGHTS_NAME)
     validation_probe_count = 0
+    training_policy = _default_training_policy()
     dataset = _DiskCachedLatentDataset(records=train_records)
     dataloader = DataLoader(
         dataset,
@@ -227,9 +236,14 @@ def train(spec: BackendSpec) -> BackendResult:
                     unet=unet,
                     noise_scheduler=noise_scheduler,
                     weight_dtype=weight_dtype,
+                    objective=training_policy.objective,
                 )
                 loss = loss_context.loss
                 accelerator.backward(loss)
+                _apply_lora_plus_gradient_ratio(
+                    unet=unet,
+                    ratio=training_policy.lora_plus_ratio,
+                )
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
                         [parameter for parameter in unet.parameters() if parameter.requires_grad],
@@ -340,6 +354,23 @@ def train(spec: BackendSpec) -> BackendResult:
                             improved=improved,
                             should_log=accelerator.is_local_main_process,
                         )
+                        training_policy, challenger_log = _challenge_quality_policies(
+                            current_policy=training_policy,
+                            batch=batch,
+                            unet=unet,
+                            optimizer=optimizer,
+                            validation_skeleton=validation_skeleton,
+                            baseline_report=validation_report,
+                            noise_scheduler=noise_scheduler,
+                            weight_dtype=weight_dtype,
+                            learning_rate=spec.learning_rate,
+                        )
+                        _write_policy_challenger_report_if_main(
+                            probe_log_path=probe_log_path,
+                            step=global_step,
+                            payload=challenger_log,
+                            should_log=accelerator.is_local_main_process,
+                        )
                 optimizer.zero_grad(set_to_none=True)
 
             if accelerator.sync_gradients:
@@ -437,6 +468,18 @@ class _BestCheckpoint:
 
 
 @dataclass(frozen=True)
+class _ObjectivePolicy:
+    name: str
+    gamma: float | None = None
+
+
+@dataclass(frozen=True)
+class _TrainingPolicy:
+    objective: _ObjectivePolicy
+    lora_plus_ratio: float
+
+
+@dataclass(frozen=True)
 class _LossContext:
     loss: torch.Tensor
     noise: torch.Tensor
@@ -467,6 +510,13 @@ def _default_guardrail_decision() -> _GuardrailDecision:
         backtracks=0,
         fallback_used=False,
         skipped_update=False,
+    )
+
+
+def _default_training_policy() -> _TrainingPolicy:
+    return _TrainingPolicy(
+        objective=_ObjectivePolicy(name="base_mse"),
+        lora_plus_ratio=1.0,
     )
 
 
@@ -799,7 +849,8 @@ def _cache_latents(
             with Image.open(rows[index].image_path) as image:
                 pixel_batches.append(transform(image.convert("RGB")))
         pixel_values = torch.stack(pixel_batches).to(device=device, dtype=dtype)
-        latents = vae.encode(pixel_values).latent_dist.sample()
+        latent_distribution = vae.encode(pixel_values).latent_dist
+        latents = _deterministic_latents(latent_distribution)
         latents = latents * vae.config.scaling_factor
         for index, tensor in zip(batch_indices, latents, strict=True):
             path = latent_cache_dir / f"{index:08d}.pt"
@@ -839,6 +890,17 @@ def _pixel_shape_cache_batches(rows: list[_TrainingRow]) -> list[list[int]]:
         for start in range(0, len(indices), CACHE_ENCODING_MAX_BATCH_SIZE):
             batches.append(indices[start : start + CACHE_ENCODING_MAX_BATCH_SIZE])
     return batches
+
+
+def _deterministic_latents(latent_distribution) -> torch.Tensor:
+    if hasattr(latent_distribution, "mode"):
+        mode = latent_distribution.mode()
+        if isinstance(mode, torch.Tensor):
+            return mode
+    mean = getattr(latent_distribution, "mean", None)
+    if isinstance(mean, torch.Tensor):
+        return mean
+    raise LorakitError("VAE latent distribution does not expose mode() or mean")
 
 
 def _cache_records(
@@ -1032,11 +1094,20 @@ def _assert_cache_records_are_consistent(records: list[_CacheRecord]) -> None:
             )
 
 
-def _write_cache_manifest(path: Path, records: list[_CacheRecord]) -> None:
+def _write_cache_manifest(
+    path: Path,
+    records: list[_CacheRecord],
+    *,
+    latent_scaling_factor: float,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": 1,
         "count": len(records),
+        "vae_latent_cache": {
+            "mode": LATENT_CACHE_MODE,
+            "scaling_factor": float(latent_scaling_factor),
+        },
         "latent_shapes": [list(shape) for shape in sorted({record.latent_shape for record in records})],
         "encoder_hidden_state_shape": list(records[0].encoder_hidden_state_shape),
         "records": [
@@ -1136,6 +1207,7 @@ def _loss_context(
     unet: UNet2DConditionModel,
     noise_scheduler: DDPMScheduler,
     weight_dtype: torch.dtype,
+    objective: _ObjectivePolicy,
 ) -> _LossContext:
     latents = _batch_tensor(batch, "latents").to(device=unet.device, dtype=weight_dtype)
     encoder_hidden_states = _batch_tensor(batch, "encoder_hidden_states").to(
@@ -1167,11 +1239,62 @@ def _loss_context(
         model_pred=prediction,
         target=target,
     )
+    loss = _objective_loss(
+        per_example_loss=per_example_loss,
+        timesteps=timesteps,
+        noise_scheduler=noise_scheduler,
+        prediction_type=str(noise_scheduler.config.prediction_type),
+        objective=objective,
+    )
     return _LossContext(
-        loss=per_example_loss.mean(),
+        loss=loss,
         noise=noise.detach().cpu(),
         timesteps=timesteps.detach().cpu(),
     )
+
+
+def _objective_loss(
+    *,
+    per_example_loss: torch.Tensor,
+    timesteps: torch.Tensor,
+    noise_scheduler: DDPMScheduler,
+    prediction_type: str,
+    objective: _ObjectivePolicy,
+) -> torch.Tensor:
+    if objective.name == "base_mse":
+        return per_example_loss.mean()
+    if objective.name == "minsnr":
+        if objective.gamma is None:
+            raise LorakitError("Min-SNR objective requires gamma")
+        weights = _snr_loss_weights(
+            timesteps=timesteps,
+            noise_scheduler=noise_scheduler,
+            gamma=objective.gamma,
+            prediction_type=prediction_type,
+        )
+        return torch.mean(per_example_loss * weights.to(device=per_example_loss.device, dtype=per_example_loss.dtype))
+    raise LorakitError(f"Unknown training objective: {objective.name}")
+
+
+def _snr_loss_weights(
+    *,
+    timesteps: torch.Tensor,
+    noise_scheduler: DDPMScheduler,
+    gamma: float,
+    prediction_type: str,
+) -> torch.Tensor:
+    if gamma <= 0.0:
+        raise LorakitError(f"Min-SNR gamma must be positive: {gamma}")
+    snr = _snr_for_timesteps(
+        noise_scheduler=noise_scheduler,
+        timesteps=timesteps.detach().long().cpu(),
+    ).to(device=timesteps.device, dtype=torch.float32)
+    clipped = torch.minimum(snr, torch.tensor(float(gamma), device=snr.device, dtype=snr.dtype))
+    if prediction_type == "epsilon":
+        return clipped / snr.clamp_min(1e-12)
+    if prediction_type == "v_prediction":
+        return clipped / (snr + 1.0).clamp_min(1e-12)
+    raise LorakitError(f"Unknown prediction type: {prediction_type}")
 
 
 def _should_probe_contexts(*, global_step: int, sync_gradients: bool) -> bool:
@@ -1570,6 +1693,329 @@ def _write_validation_report_if_main(
     with probe_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True))
         handle.write("\n")
+
+
+def _write_policy_challenger_report_if_main(
+    *,
+    probe_log_path: Path,
+    step: int,
+    payload: dict[str, object],
+    should_log: bool,
+) -> None:
+    if not should_log:
+        return
+    record = {"step": int(step), "probe_status": "quality_challengers"}
+    record.update(payload)
+    with probe_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True))
+        handle.write("\n")
+
+
+def _challenge_quality_policies(
+    *,
+    current_policy: _TrainingPolicy,
+    batch: dict[str, object],
+    unet: UNet2DConditionModel,
+    optimizer,
+    validation_skeleton: _ValidationSkeleton,
+    baseline_report: _ValidationReport,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    learning_rate: float,
+) -> tuple[_TrainingPolicy, dict[str, object]]:
+    parameter_snapshot = _snapshot_trainable_parameters(certified_trainable_parameters(unet))
+    parameters = certified_trainable_parameters(unet)
+    gradient_snapshot = _snapshot_trainable_gradients(parameters)
+    optimizer_snapshot = _snapshot_optimizer_state(optimizer)
+    if optimizer_snapshot is None:
+        return current_policy, {
+            "active_objective": _objective_label(current_policy.objective),
+            "selected_objective": _objective_label(current_policy.objective),
+            "objective_switched": False,
+            "lora_plus": {
+                "active_ratio": float(current_policy.lora_plus_ratio),
+                "selected_ratio": float(current_policy.lora_plus_ratio),
+                "ratio_switched": False,
+                "reason": "optimizer_state_snapshot_unavailable",
+            },
+        }
+
+    objective_candidates = _objective_candidates(
+        current_policy=current_policy,
+        baseline_report=baseline_report,
+        validation_skeleton=validation_skeleton,
+        noise_scheduler=noise_scheduler,
+    )
+    objective_reports = {}
+    best_objective = current_policy.objective
+    best_objective_report = baseline_report
+    for objective in objective_candidates:
+        report = _virtual_policy_step_validation_report(
+            batch=batch,
+            unet=unet,
+            optimizer=optimizer,
+            parameters=parameters,
+            parameter_snapshot=parameter_snapshot,
+            gradient_snapshot=gradient_snapshot,
+            optimizer_snapshot=optimizer_snapshot,
+            validation_skeleton=validation_skeleton,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+            objective=objective,
+            lora_plus_ratio=current_policy.lora_plus_ratio,
+        )
+        objective_reports[_objective_label(objective)] = _validation_delta_log(
+            baseline=baseline_report,
+            candidate=report,
+            gamma=objective.gamma,
+        )
+        if _validation_score_improves(
+            baseline=best_objective_report,
+            candidate=report,
+        ):
+            best_objective = objective
+            best_objective_report = report
+
+    ratio_candidates = _lora_plus_candidate_ratios(unet)
+    ratio_reports = {}
+    best_ratio = current_policy.lora_plus_ratio
+    best_ratio_report = best_objective_report
+    scale_a, scale_b = _lora_relative_gradient_scales(unet)
+    for ratio in ratio_candidates:
+        report = _virtual_policy_step_validation_report(
+            batch=batch,
+            unet=unet,
+            optimizer=optimizer,
+            parameters=parameters,
+            parameter_snapshot=parameter_snapshot,
+            gradient_snapshot=gradient_snapshot,
+            optimizer_snapshot=optimizer_snapshot,
+            validation_skeleton=validation_skeleton,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+            objective=best_objective,
+            lora_plus_ratio=ratio,
+        )
+        ratio_reports[_ratio_label(ratio)] = _validation_delta_log(
+            baseline=baseline_report,
+            candidate=report,
+        )
+        if _validation_score_improves(
+            baseline=best_ratio_report,
+            candidate=report,
+        ):
+            best_ratio = ratio
+            best_ratio_report = report
+
+    _restore_trainable_parameters(parameters, parameter_snapshot)
+    _restore_trainable_gradients(parameters, gradient_snapshot)
+    _restore_optimizer_state(optimizer, optimizer_snapshot)
+
+    next_policy = _TrainingPolicy(
+        objective=best_objective,
+        lora_plus_ratio=best_ratio,
+    )
+    return next_policy, {
+        "active_objective": _objective_label(current_policy.objective),
+        "objective_candidates": objective_reports,
+        "selected_objective": _objective_label(best_objective),
+        "objective_switched": _objective_label(best_objective) != _objective_label(current_policy.objective),
+        "lora_plus": {
+            "active_ratio": float(current_policy.lora_plus_ratio),
+            "candidate_ratios": [float(value) for value in ratio_candidates],
+            "selected_ratio": float(best_ratio),
+            "ratio_switched": abs(float(best_ratio) - float(current_policy.lora_plus_ratio)) > 1e-12,
+            "scale_A": float(scale_a),
+            "scale_B": float(scale_b),
+            "validation_scores": ratio_reports,
+        },
+        "rank_probe": {
+            "trigger": "not_run_before_capacity_probe_milestone",
+            "rank_growth_accepted": False,
+        },
+    }
+
+
+def _virtual_policy_step_validation_report(
+    *,
+    batch: dict[str, object],
+    unet: UNet2DConditionModel,
+    optimizer,
+    parameters: list[torch.nn.Parameter],
+    parameter_snapshot: list[torch.Tensor],
+    gradient_snapshot: list[torch.Tensor | None],
+    optimizer_snapshot,
+    validation_skeleton: _ValidationSkeleton,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    objective: _ObjectivePolicy,
+    lora_plus_ratio: float,
+) -> _ValidationReport:
+    _restore_trainable_parameters(parameters, parameter_snapshot)
+    _restore_trainable_gradients(parameters, gradient_snapshot)
+    _restore_optimizer_state(optimizer, optimizer_snapshot)
+    optimizer.zero_grad(set_to_none=True)
+    loss_context = _loss_context(
+        batch=batch,
+        unet=unet,
+        noise_scheduler=noise_scheduler,
+        weight_dtype=weight_dtype,
+        objective=objective,
+    )
+    loss_context.loss.backward()
+    _apply_lora_plus_gradient_ratio(unet=unet, ratio=lora_plus_ratio)
+    optimizer.step()
+    with torch.no_grad():
+        report = _evaluate_validation_skeleton(
+            skeleton=validation_skeleton,
+            unet=unet,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+            step=-1,
+        )
+    return report
+
+
+def _objective_candidates(
+    *,
+    current_policy: _TrainingPolicy,
+    baseline_report: _ValidationReport,
+    validation_skeleton: _ValidationSkeleton,
+    noise_scheduler: DDPMScheduler,
+) -> list[_ObjectivePolicy]:
+    candidates = [_ObjectivePolicy(name="base_mse")]
+    gammas = [
+        _validation_bucket_gamma(
+            validation_skeleton=validation_skeleton,
+            bucket="mid",
+        ),
+        5.0,
+        _validation_bucket_gamma(
+            validation_skeleton=validation_skeleton,
+            bucket=max(baseline_report.loss_by_snr_bucket, key=baseline_report.loss_by_snr_bucket.get),
+        ),
+    ]
+    if current_policy.objective.name == "minsnr" and current_policy.objective.gamma is not None:
+        gammas.append(current_policy.objective.gamma)
+    seen = set()
+    for gamma in gammas:
+        key = round(float(gamma), 8)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(_ObjectivePolicy(name="minsnr", gamma=float(gamma)))
+    return candidates
+
+
+def _validation_bucket_gamma(*, validation_skeleton: _ValidationSkeleton, bucket: str) -> float:
+    values = [item.snr for item in validation_skeleton.items if item.snr_bucket == bucket]
+    if not values:
+        raise LorakitError(f"Validation skeleton has no SNR bucket: {bucket}")
+    return float(sum(values) / len(values))
+
+
+def _validation_delta_log(
+    *,
+    baseline: _ValidationReport,
+    candidate: _ValidationReport,
+    gamma: float | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "validation_loss_max_snr_bucket_delta": float(candidate.loss_max_snr_bucket - baseline.loss_max_snr_bucket),
+        "validation_loss_mean_delta": float(candidate.loss_mean - baseline.loss_mean),
+    }
+    if gamma is not None:
+        payload["gamma"] = float(gamma)
+    return payload
+
+
+def _validation_score_improves(*, baseline: _ValidationReport, candidate: _ValidationReport) -> bool:
+    tolerance = _validation_score_tolerance(baseline)
+    if candidate.loss_max_snr_bucket < baseline.loss_max_snr_bucket - tolerance:
+        return True
+    if candidate.loss_max_snr_bucket > baseline.loss_max_snr_bucket + tolerance:
+        return False
+    return candidate.loss_mean < baseline.loss_mean - tolerance
+
+
+def _validation_score_tolerance(report: _ValidationReport) -> float:
+    return max(
+        VALIDATION_SCORE_ABSOLUTE_TOLERANCE,
+        VALIDATION_SCORE_RELATIVE_TOLERANCE * max(report.loss_by_snr_bucket.values()),
+    )
+
+
+def _objective_label(objective: _ObjectivePolicy) -> str:
+    if objective.name == "base_mse":
+        return "base_mse"
+    if objective.name == "minsnr" and objective.gamma is not None:
+        return f"minsnr_gamma_{objective.gamma:.6g}"
+    raise LorakitError(f"Cannot label objective: {objective}")
+
+
+def _ratio_label(ratio: float) -> str:
+    return f"ratio_{ratio:.6g}"
+
+
+def _lora_plus_candidate_ratios(unet: UNet2DConditionModel) -> list[float]:
+    scale_a, scale_b = _lora_relative_gradient_scales(unet)
+    if scale_a <= 0.0 or scale_b <= 0.0:
+        return [1.0]
+    ratio = max(0.1, min(10.0, scale_a / max(scale_b, 1e-12)))
+    inverse = max(0.1, min(10.0, 1.0 / ratio))
+    candidates: list[float] = []
+    for value in (1.0, ratio, inverse):
+        if not any(abs(value - existing) <= 1e-8 for existing in candidates):
+            candidates.append(float(value))
+    return candidates
+
+
+def _lora_relative_gradient_scales(unet: UNet2DConditionModel) -> tuple[float, float]:
+    lora_a, lora_b = _partition_lora_parameters(unet)
+    return _relative_gradient_scale(lora_a), _relative_gradient_scale(lora_b)
+
+
+def _partition_lora_parameters(
+    unet: UNet2DConditionModel,
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    lora_a: list[torch.nn.Parameter] = []
+    lora_b: list[torch.nn.Parameter] = []
+    for name, parameter in unet.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if "lora_A" in name:
+            lora_a.append(parameter)
+        elif "lora_B" in name:
+            lora_b.append(parameter)
+    return lora_a, lora_b
+
+
+def _relative_gradient_scale(parameters: list[torch.nn.Parameter]) -> float:
+    if not parameters:
+        return 0.0
+    grad_square_sum = 0.0
+    value_square_sum = 0.0
+    count = 0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad_square_sum += float(torch.sum(parameter.grad.detach().float().pow(2)).item())
+        value_square_sum += float(torch.sum(parameter.detach().float().pow(2)).item())
+        count += int(parameter.numel())
+    if count <= 0:
+        return 0.0
+    grad_rms = (grad_square_sum / float(count)) ** 0.5
+    value_rms = (value_square_sum / float(count)) ** 0.5
+    return float(grad_rms / max(value_rms, 1e-12))
+
+
+def _apply_lora_plus_gradient_ratio(*, unet: UNet2DConditionModel, ratio: float) -> None:
+    if abs(float(ratio) - 1.0) <= 1e-12:
+        return
+    _lora_a, lora_b = _partition_lora_parameters(unet)
+    for parameter in lora_b:
+        if parameter.grad is not None:
+            parameter.grad.mul_(float(ratio))
 
 
 def _write_streaming_context_probe_if_main(
