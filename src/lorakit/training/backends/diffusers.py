@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import random
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -42,9 +43,13 @@ from lorakit.training.certified_stepper import (
 
 LORA_TARGET_MODULES = ["to_k", "to_q", "to_v", "to_out.0"]
 LORA_WEIGHTS_NAME = "pytorch_lora_weights.safetensors"
+BEST_LORA_WEIGHTS_NAME = "best_lora_weights.safetensors"
 MAX_GRAD_NORM = 1.0
 LR_WARMUP_STEPS = 0
 VAE_DOWNSAMPLE_FACTOR: Final = 8
+VALIDATION_FRACTION: Final = 0.08
+VALIDATION_MAX_ITEMS: Final = 32
+VALIDATION_EVERY_PROBES: Final = 1
 CACHE_ENCODING_MAX_BATCH_SIZE: Final = 4
 CACHE_ENCODING_MIN_BATCH_SIZE: Final = 1
 CACHE_DIR_NAME: Final = "tensor-cache"
@@ -167,11 +172,18 @@ def train(spec: BackendSpec) -> BackendResult:
         encoder_hidden_state_paths=encoder_hidden_state_paths,
     )
     _write_cache_manifest(cache_dir / CACHE_MANIFEST_NAME, cache_records)
-    dataset = _DiskCachedLatentDataset(records=cache_records)
+    train_records, validation_records = _split_train_validation_records(cache_records)
+    validation_skeleton = _build_validation_skeleton(
+        records=validation_records,
+        noise_scheduler=noise_scheduler,
+    )
+    best_checkpoint = _BestCheckpoint.empty(spec.output_dir / BEST_LORA_WEIGHTS_NAME)
+    validation_probe_count = 0
+    dataset = _DiskCachedLatentDataset(records=train_records)
     dataloader = DataLoader(
         dataset,
         batch_sampler=_LatentShapeBatchSampler(
-            records=cache_records,
+            records=train_records,
             batch_size=spec.batch_size,
         ),
         collate_fn=_collate_cached,
@@ -295,10 +307,38 @@ def train(spec: BackendSpec) -> BackendResult:
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
                         )
+                committed_update = not guardrail_decision.skipped_update
                 if not guardrail_decision.handled_update:
                     optimizer.step()
-                if not guardrail_decision.skipped_update:
+                if committed_update:
                     scheduler.step()
+                if should_probe and committed_update and validation_skeleton.items:
+                    validation_probe_count += 1
+                    if validation_probe_count % VALIDATION_EVERY_PROBES == 0:
+                        validation_report = _evaluate_validation_skeleton(
+                            skeleton=validation_skeleton,
+                            unet=unet,
+                            noise_scheduler=noise_scheduler,
+                            weight_dtype=weight_dtype,
+                            step=global_step,
+                        )
+                        improved, best_checkpoint = _select_best_checkpoint(
+                            current=best_checkpoint,
+                            report=validation_report,
+                        )
+                        if improved and accelerator.is_main_process:
+                            _save_named_lora_weights(
+                                unet=accelerator.unwrap_model(unet),
+                                output_dir=spec.output_dir,
+                                filename=BEST_LORA_WEIGHTS_NAME,
+                            )
+                        _write_validation_report_if_main(
+                            probe_log_path=probe_log_path,
+                            report=validation_report,
+                            best_checkpoint=best_checkpoint,
+                            improved=improved,
+                            should_log=accelerator.is_local_main_process,
+                        )
                 optimizer.zero_grad(set_to_none=True)
 
             if accelerator.sync_gradients:
@@ -310,15 +350,15 @@ def train(spec: BackendSpec) -> BackendResult:
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unwrapped_unet = accelerator.unwrap_model(unet)
-        lora_layers = convert_state_dict_to_diffusers(
-            get_peft_model_state_dict(unwrapped_unet)
-        )
-        StableDiffusionPipeline.save_lora_weights(
-            save_directory=spec.output_dir,
-            unet_lora_layers=lora_layers,
-            safe_serialization=True,
-        )
+        best_model_path = spec.output_dir / BEST_LORA_WEIGHTS_NAME
+        if best_model_path.exists():
+            shutil.copy2(best_model_path, spec.output_dir / LORA_WEIGHTS_NAME)
+        else:
+            _save_named_lora_weights(
+                unet=accelerator.unwrap_model(unet),
+                output_dir=spec.output_dir,
+                filename=LORA_WEIGHTS_NAME,
+            )
     accelerator.end_training()
 
     model_path = spec.output_dir / LORA_WEIGHTS_NAME
@@ -328,7 +368,7 @@ def train(spec: BackendSpec) -> BackendResult:
         _write_probe_summary(probe_log_path=probe_log_path, summary_path=probe_summary_path)
     artifact_paths = tuple(
         path
-        for path in (probe_log_path, probe_summary_path)
+        for path in (probe_log_path, probe_summary_path, spec.output_dir / BEST_LORA_WEIGHTS_NAME)
         if path.exists()
     )
     return BackendResult(model_path=model_path, artifact_paths=artifact_paths)
@@ -353,6 +393,46 @@ class _CacheRecord:
     encoder_hidden_state_path: Path
     latent_shape: tuple[int, ...]
     encoder_hidden_state_shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ValidationItem:
+    record: _CacheRecord
+    timestep: int
+    noise_seed: int
+    snr: float
+    snr_bucket: str
+
+
+@dataclass(frozen=True)
+class _ValidationSkeleton:
+    items: tuple[_ValidationItem, ...]
+
+
+@dataclass(frozen=True)
+class _ValidationReport:
+    step: int
+    loss_mean: float
+    loss_max_snr_bucket: float
+    loss_by_snr_bucket: dict[str, float]
+    item_count: int
+
+
+@dataclass(frozen=True)
+class _BestCheckpoint:
+    path: Path
+    step: int | None
+    loss_max_snr_bucket: float | None
+    loss_mean: float | None
+
+    @classmethod
+    def empty(cls, path: Path) -> "_BestCheckpoint":
+        return cls(
+            path=path,
+            step=None,
+            loss_max_snr_bucket=None,
+            loss_mean=None,
+        )
 
 
 @dataclass(frozen=True)
@@ -794,6 +874,108 @@ def _cache_records(
     return records
 
 
+def _split_train_validation_records(
+    records: list[_CacheRecord],
+) -> tuple[list[_CacheRecord], list[_CacheRecord]]:
+    if len(records) < 2:
+        return records, []
+    validation_count = min(
+        VALIDATION_MAX_ITEMS,
+        max(1, int(round(len(records) * VALIDATION_FRACTION))),
+    )
+    validation_hashes = {
+        record.image_sha256
+        for record in sorted(records, key=lambda item: item.image_sha256)[:validation_count]
+    }
+    train_records = [
+        record
+        for record in records
+        if record.image_sha256 not in validation_hashes
+    ]
+    validation_records = [
+        record
+        for record in records
+        if record.image_sha256 in validation_hashes
+    ]
+    if not train_records:
+        return records, []
+    return train_records, validation_records
+
+
+def _build_validation_skeleton(
+    *,
+    records: list[_CacheRecord],
+    noise_scheduler: DDPMScheduler,
+) -> _ValidationSkeleton:
+    if not records:
+        return _ValidationSkeleton(items=())
+    timesteps = [
+        _validation_timestep(
+            index=index,
+            count=len(records),
+            total_timesteps=int(noise_scheduler.config.num_train_timesteps),
+        )
+        for index in range(len(records))
+    ]
+    snr_values = _snr_for_timesteps(
+        noise_scheduler=noise_scheduler,
+        timesteps=torch.tensor(timesteps, dtype=torch.long),
+    ).detach().float().cpu()
+    buckets = _snr_buckets(snr_values)
+    items = tuple(
+        _ValidationItem(
+            record=record,
+            timestep=int(timestep),
+            noise_seed=_validation_noise_seed(record),
+            snr=float(snr),
+            snr_bucket=bucket,
+        )
+        for record, timestep, snr, bucket in zip(
+            records,
+            timesteps,
+            snr_values.tolist(),
+            buckets,
+            strict=True,
+        )
+    )
+    return _ValidationSkeleton(items=items)
+
+
+def _validation_timestep(*, index: int, count: int, total_timesteps: int) -> int:
+    if count <= 0:
+        raise LorakitError("Validation timestep count must be greater than zero")
+    if total_timesteps <= 0:
+        raise LorakitError("Noise scheduler must expose at least one timestep")
+    if count == 1:
+        return max(0, total_timesteps // 2)
+    position = index / float(count - 1)
+    return min(total_timesteps - 1, max(0, int(round(position * float(total_timesteps - 1)))))
+
+
+def _validation_noise_seed(record: _CacheRecord) -> int:
+    return int(record.image_sha256[:16], 16) % (2**31)
+
+
+def _snr_buckets(snr_values: torch.Tensor) -> list[str]:
+    if snr_values.ndim != 1:
+        raise LorakitError("Validation SNR values must be rank-1")
+    if snr_values.numel() == 0:
+        return []
+    ordered = sorted(float(value) for value in snr_values.tolist())
+    low_threshold = ordered[int((len(ordered) - 1) / 3)]
+    high_threshold = ordered[int(2 * (len(ordered) - 1) / 3)]
+    buckets: list[str] = []
+    for value in snr_values.tolist():
+        current = float(value)
+        if current <= low_threshold:
+            buckets.append("low")
+        elif current <= high_threshold:
+            buckets.append("mid")
+        else:
+            buckets.append("high")
+    return buckets
+
+
 def _assert_cache_records_are_consistent(records: list[_CacheRecord]) -> None:
     first = records[0]
     for record in records:
@@ -1130,6 +1312,7 @@ def _write_probe_status_if_main(
 
 def _write_probe_summary(*, probe_log_path: Path, summary_path: Path) -> None:
     probes: list[dict[str, object]] = []
+    validation_reports: list[dict[str, object]] = []
     with probe_log_path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
@@ -1137,6 +1320,8 @@ def _write_probe_summary(*, probe_log_path: Path, summary_path: Path) -> None:
             payload = json.loads(line)
             if isinstance(payload, dict) and "candidate_selection" in payload:
                 probes.append(payload)
+            if isinstance(payload, dict) and payload.get("probe_status") == "validation":
+                validation_reports.append(payload)
 
     probe_count = len(probes)
     if probe_count == 0:
@@ -1149,6 +1334,8 @@ def _write_probe_summary(*, probe_log_path: Path, summary_path: Path) -> None:
             "mean_dual_thickness": 0.0,
             "max_dual_thickness": 0.0,
             "conflict_probe_fraction": 0.0,
+            "validation_count": len(validation_reports),
+            "best_checkpoint_step": _best_validation_step(validation_reports),
         }
     else:
         dual_thickness = [float(probe.get("dual_thickness", 0.0)) for probe in probes]
@@ -1189,11 +1376,158 @@ def _write_probe_summary(*, probe_log_path: Path, summary_path: Path) -> None:
             "mean_dual_thickness": float(sum(dual_thickness) / probe_count),
             "max_dual_thickness": float(max(dual_thickness)),
             "conflict_probe_fraction": float(conflict_count / probe_count),
+            "validation_count": len(validation_reports),
+            "best_checkpoint_step": _best_validation_step(validation_reports),
         }
 
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _best_validation_step(validation_reports: list[dict[str, object]]) -> int | None:
+    improved = [
+        report
+        for report in validation_reports
+        if bool(report.get("best_checkpoint_improved", False))
+    ]
+    if not improved:
+        return None
+    return int(improved[-1]["step"])
+
+
+def _evaluate_validation_skeleton(
+    *,
+    skeleton: _ValidationSkeleton,
+    unet: UNet2DConditionModel,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    step: int,
+) -> _ValidationReport:
+    if not skeleton.items:
+        raise LorakitError("Validation skeleton has no items")
+    losses_by_bucket: dict[str, list[float]] = {}
+    for item in skeleton.items:
+        loss = _validation_item_loss(
+            item=item,
+            unet=unet,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+        )
+        losses_by_bucket.setdefault(item.snr_bucket, []).append(loss)
+    bucket_means = {
+        bucket: float(sum(losses) / len(losses))
+        for bucket, losses in losses_by_bucket.items()
+    }
+    all_losses = [
+        loss
+        for losses in losses_by_bucket.values()
+        for loss in losses
+    ]
+    return _ValidationReport(
+        step=int(step),
+        loss_mean=float(sum(all_losses) / len(all_losses)),
+        loss_max_snr_bucket=float(max(bucket_means.values())),
+        loss_by_snr_bucket=bucket_means,
+        item_count=len(all_losses),
+    )
+
+
+@torch.no_grad()
+def _validation_item_loss(
+    *,
+    item: _ValidationItem,
+    unet: UNet2DConditionModel,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+) -> float:
+    latent = _load_tensor(item.record.latent_path, expected_shape=item.record.latent_shape)
+    hidden = _load_tensor(
+        item.record.encoder_hidden_state_path,
+        expected_shape=item.record.encoder_hidden_state_shape,
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(item.noise_seed)
+    noise = torch.randn(
+        item.record.latent_shape,
+        generator=generator,
+        dtype=torch.float32,
+    )
+    batch = {
+        "latents": latent.unsqueeze(0),
+        "encoder_hidden_states": hidden.unsqueeze(0),
+    }
+    loss = _fixed_subset_context_loss(
+        batch=batch,
+        mask=torch.tensor([True], device=unet.device),
+        unet=unet,
+        noise_scheduler=noise_scheduler,
+        weight_dtype=weight_dtype,
+        noise=noise.unsqueeze(0),
+        timesteps=torch.tensor([item.timestep], dtype=torch.long),
+    )
+    return float(loss.detach().float().cpu().item())
+
+
+def _select_best_checkpoint(
+    *,
+    current: _BestCheckpoint,
+    report: _ValidationReport,
+) -> tuple[bool, _BestCheckpoint]:
+    if current.loss_max_snr_bucket is None or current.loss_mean is None or current.step is None:
+        return True, _BestCheckpoint(
+            path=current.path,
+            step=report.step,
+            loss_max_snr_bucket=report.loss_max_snr_bucket,
+            loss_mean=report.loss_mean,
+        )
+    candidate_key = (
+        report.loss_max_snr_bucket,
+        report.loss_mean,
+        report.step,
+    )
+    current_key = (
+        current.loss_max_snr_bucket,
+        current.loss_mean,
+        current.step,
+    )
+    if candidate_key < current_key:
+        return True, _BestCheckpoint(
+            path=current.path,
+            step=report.step,
+            loss_max_snr_bucket=report.loss_max_snr_bucket,
+            loss_mean=report.loss_mean,
+        )
+    return False, current
+
+
+def _write_validation_report_if_main(
+    *,
+    probe_log_path: Path,
+    report: _ValidationReport,
+    best_checkpoint: _BestCheckpoint,
+    improved: bool,
+    should_log: bool,
+) -> None:
+    if not should_log:
+        return
+    payload = {
+        "step": int(report.step),
+        "probe_status": "validation",
+        "validation_loss_mean": float(report.loss_mean),
+        "validation_loss_max_snr_bucket": float(report.loss_max_snr_bucket),
+        "validation_loss_by_snr_bucket": {
+            bucket: float(loss)
+            for bucket, loss in sorted(report.loss_by_snr_bucket.items())
+        },
+        "validation_item_count": int(report.item_count),
+        "best_checkpoint_improved": bool(improved),
+        "best_checkpoint_step": best_checkpoint.step,
+        "best_checkpoint_path": str(best_checkpoint.path),
+    }
+    with probe_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True))
         handle.write("\n")
 
 
@@ -1739,6 +2073,31 @@ def _try_backtracked_adamw_update(
         step_size=step_size,
         context_ids=context_ids,
     )
+
+
+def _save_named_lora_weights(
+    *,
+    unet: UNet2DConditionModel,
+    output_dir: Path,
+    filename: str,
+) -> Path:
+    temporary_dir = output_dir / f".{filename}.tmp"
+    if temporary_dir.exists():
+        shutil.rmtree(temporary_dir)
+    lora_layers = convert_state_dict_to_diffusers(
+        get_peft_model_state_dict(unet)
+    )
+    StableDiffusionPipeline.save_lora_weights(
+        save_directory=temporary_dir,
+        unet_lora_layers=lora_layers,
+        safe_serialization=True,
+    )
+    source = temporary_dir / LORA_WEIGHTS_NAME
+    destination = output_dir / filename
+    shutil.copy2(source, destination)
+    shutil.rmtree(temporary_dir)
+    return destination
+
 
 def _evaluate_probe_context_losses(
     *,

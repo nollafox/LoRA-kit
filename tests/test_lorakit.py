@@ -1447,6 +1447,13 @@ def test_diffusers_probe_summary_counts_guardrail_outcomes(tmp_path):
                 ),
                 json.dumps(
                     {
+                        "best_checkpoint_improved": True,
+                        "probe_status": "validation",
+                        "step": 2,
+                    }
+                ),
+                json.dumps(
+                    {
                         "dual_thickness": 3.0,
                         "negative_cosine_fraction": 0.0,
                         "candidate_certificates": {
@@ -1480,6 +1487,109 @@ def test_diffusers_probe_summary_counts_guardrail_outcomes(tmp_path):
     assert summary["fallback_used"] == 1
     assert summary["mean_dual_thickness"] == pytest.approx(2.0)
     assert summary["conflict_probe_fraction"] == pytest.approx(0.5)
+    assert summary["validation_count"] == 1
+    assert summary["best_checkpoint_step"] == 2
+
+
+def test_diffusers_validation_split_is_deterministic_and_keeps_training_records():
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    records = [
+        diffusers_backend._CacheRecord(
+            image=f"{index}.png",
+            caption_sha256=f"caption-{index}",
+            image_sha256=f"{index:064x}",
+            latent_path=Path(f"latents/{index}.pt"),
+            encoder_hidden_state_path=Path(f"text/{index}.pt"),
+            latent_shape=(4, 8, 8),
+            encoder_hidden_state_shape=(77, 768),
+        )
+        for index in range(20)
+    ]
+
+    first_train, first_validation = diffusers_backend._split_train_validation_records(records)
+    second_train, second_validation = diffusers_backend._split_train_validation_records(list(reversed(records)))
+
+    assert sorted(record.image_sha256 for record in first_validation) == sorted(
+        record.image_sha256 for record in second_validation
+    )
+    assert first_validation
+    assert first_train
+
+
+def test_diffusers_validation_skeleton_has_fixed_timesteps_and_snr_buckets(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    class FakeSchedulerConfig:
+        num_train_timesteps = 9
+
+    class FakeScheduler:
+        config = FakeSchedulerConfig()
+        alphas_cumprod = torch.linspace(0.99, 0.01, 9)
+
+    records = [
+        diffusers_backend._CacheRecord(
+            image=f"{index}.png",
+            caption_sha256=f"caption-{index}",
+            image_sha256=f"{index + 1:064x}",
+            latent_path=tmp_path / f"latents-{index}.pt",
+            encoder_hidden_state_path=tmp_path / f"text-{index}.pt",
+            latent_shape=(4, 8, 8),
+            encoder_hidden_state_shape=(77, 768),
+        )
+        for index in range(3)
+    ]
+
+    skeleton = diffusers_backend._build_validation_skeleton(
+        records=records,
+        noise_scheduler=FakeScheduler(),
+    )
+
+    assert [item.timestep for item in skeleton.items] == [0, 4, 8]
+    assert {item.snr_bucket for item in skeleton.items} == {"low", "mid", "high"}
+
+
+def test_diffusers_best_checkpoint_selection_prefers_bottleneck_then_mean(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    empty = diffusers_backend._BestCheckpoint.empty(tmp_path / "best.safetensors")
+    improved, first = diffusers_backend._select_best_checkpoint(
+        current=empty,
+        report=diffusers_backend._ValidationReport(
+            step=2,
+            loss_mean=0.5,
+            loss_max_snr_bucket=0.7,
+            loss_by_snr_bucket={"low": 0.7},
+            item_count=1,
+        ),
+    )
+    assert improved
+
+    improved, second = diffusers_backend._select_best_checkpoint(
+        current=first,
+        report=diffusers_backend._ValidationReport(
+            step=3,
+            loss_mean=0.4,
+            loss_max_snr_bucket=0.8,
+            loss_by_snr_bucket={"low": 0.8},
+            item_count=1,
+        ),
+    )
+    assert not improved
+    assert second == first
+
+    improved, third = diffusers_backend._select_best_checkpoint(
+        current=first,
+        report=diffusers_backend._ValidationReport(
+            step=4,
+            loss_mean=0.6,
+            loss_max_snr_bucket=0.6,
+            loss_by_snr_bucket={"low": 0.6},
+            item_count=1,
+        ),
+    )
+    assert improved
+    assert third.step == 4
 
 
 def test_certified_stepper_projects_to_simplex():
