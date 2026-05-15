@@ -1545,8 +1545,13 @@ def test_diffusers_validation_skeleton_has_fixed_timesteps_and_snr_buckets(tmp_p
         noise_scheduler=FakeScheduler(),
     )
 
-    assert [item.timestep for item in skeleton.items] == [0, 4, 8]
+    assert [item.timestep for item in skeleton.items] == [1, 4, 7] * 3
     assert {item.snr_bucket for item in skeleton.items} == {"low", "mid", "high"}
+    assert len(skeleton.items) == len(records) * 3
+    for record in records:
+        record_items = [item for item in skeleton.items if item.record == record]
+        assert {item.snr_bucket for item in record_items} == {"low", "mid", "high"}
+        assert len({item.noise_seed for item in record_items}) == 3
 
 
 def test_diffusers_best_checkpoint_selection_prefers_bottleneck_then_mean(tmp_path):

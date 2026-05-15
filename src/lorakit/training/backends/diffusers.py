@@ -50,6 +50,7 @@ VAE_DOWNSAMPLE_FACTOR: Final = 8
 VALIDATION_FRACTION: Final = 0.08
 VALIDATION_MAX_ITEMS: Final = 32
 VALIDATION_EVERY_PROBES: Final = 1
+VALIDATION_SNR_BUCKETS: Final = ("high", "mid", "low")
 CACHE_ENCODING_MAX_BATCH_SIZE: Final = 4
 CACHE_ENCODING_MIN_BATCH_SIZE: Final = 1
 CACHE_DIR_NAME: Final = "tensor-cache"
@@ -883,9 +884,13 @@ def _split_train_validation_records(
         VALIDATION_MAX_ITEMS,
         max(1, int(round(len(records) * VALIDATION_FRACTION))),
     )
+    validation_candidates = sorted(
+        records,
+        key=_validation_split_key,
+    )[:validation_count]
     validation_hashes = {
         record.image_sha256
-        for record in sorted(records, key=lambda item: item.image_sha256)[:validation_count]
+        for record in validation_candidates
     }
     train_records = [
         record
@@ -902,6 +907,12 @@ def _split_train_validation_records(
     return train_records, validation_records
 
 
+def _validation_split_key(record: _CacheRecord) -> str:
+    return hashlib.sha256(
+        f"lorakit-validation-v1:{record.image_sha256}".encode("utf-8")
+    ).hexdigest()
+
+
 def _build_validation_skeleton(
     *,
     records: list[_CacheRecord],
@@ -909,51 +920,81 @@ def _build_validation_skeleton(
 ) -> _ValidationSkeleton:
     if not records:
         return _ValidationSkeleton(items=())
+    bucket_timesteps = _validation_bucket_timesteps(
+        total_timesteps=int(noise_scheduler.config.num_train_timesteps),
+    )
     timesteps = [
-        _validation_timestep(
-            index=index,
-            count=len(records),
-            total_timesteps=int(noise_scheduler.config.num_train_timesteps),
-        )
-        for index in range(len(records))
+        timestep
+        for _record in records
+        for timestep in bucket_timesteps.values()
     ]
     snr_values = _snr_for_timesteps(
         noise_scheduler=noise_scheduler,
         timesteps=torch.tensor(timesteps, dtype=torch.long),
     ).detach().float().cpu()
-    buckets = _snr_buckets(snr_values)
+    bucket_names = [
+        bucket
+        for _record in records
+        for bucket in bucket_timesteps
+    ]
     items = tuple(
         _ValidationItem(
             record=record,
             timestep=int(timestep),
-            noise_seed=_validation_noise_seed(record),
+            noise_seed=_validation_noise_seed(record=record, snr_bucket=bucket),
             snr=float(snr),
             snr_bucket=bucket,
         )
-        for record, timestep, snr, bucket in zip(
-            records,
+        for record, timestep, bucket, snr in zip(
+            [
+                record
+                for record in records
+                for _bucket in bucket_timesteps
+            ],
             timesteps,
+            bucket_names,
             snr_values.tolist(),
-            buckets,
             strict=True,
         )
     )
     return _ValidationSkeleton(items=items)
 
 
-def _validation_timestep(*, index: int, count: int, total_timesteps: int) -> int:
-    if count <= 0:
-        raise LorakitError("Validation timestep count must be greater than zero")
+def _validation_bucket_timesteps(*, total_timesteps: int) -> dict[str, int]:
     if total_timesteps <= 0:
         raise LorakitError("Noise scheduler must expose at least one timestep")
-    if count == 1:
-        return max(0, total_timesteps // 2)
-    position = index / float(count - 1)
-    return min(total_timesteps - 1, max(0, int(round(position * float(total_timesteps - 1)))))
+    return {
+        "high": _validation_timestep_at_fraction(
+            fraction=0.10,
+            total_timesteps=total_timesteps,
+        ),
+        "mid": _validation_timestep_at_fraction(
+            fraction=0.50,
+            total_timesteps=total_timesteps,
+        ),
+        "low": _validation_timestep_at_fraction(
+            fraction=0.90,
+            total_timesteps=total_timesteps,
+        ),
+    }
 
 
-def _validation_noise_seed(record: _CacheRecord) -> int:
-    return int(record.image_sha256[:16], 16) % (2**31)
+def _validation_timestep_at_fraction(*, fraction: float, total_timesteps: int) -> int:
+    if total_timesteps <= 0:
+        raise LorakitError("Noise scheduler must expose at least one timestep")
+    if fraction < 0.0 or fraction > 1.0:
+        raise LorakitError(f"Validation timestep fraction must be within [0, 1]: {fraction}")
+    return min(
+        total_timesteps - 1,
+        max(0, int(round(float(total_timesteps - 1) * fraction))),
+    )
+
+
+def _validation_noise_seed(*, record: _CacheRecord, snr_bucket: str) -> int:
+    digest = hashlib.sha256(
+        f"lorakit-validation-noise-v1:{record.image_sha256}:{snr_bucket}".encode("utf-8")
+    ).hexdigest()
+    return int(digest[:16], 16) % (2**31)
 
 
 def _snr_buckets(snr_values: torch.Tensor) -> list[str]:
