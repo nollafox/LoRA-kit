@@ -387,6 +387,117 @@ def probe_to_log_dict(
     return payload
 
 
+
+def _normalize_weights(values: torch.Tensor) -> torch.Tensor:
+    weights = values.detach().float().cpu().reshape(-1)
+    if weights.numel() == 0:
+        raise ValueError("weights cannot be empty")
+    if torch.any(weights < 0):
+        raise ValueError("weights must be nonnegative")
+    total = float(weights.sum().item())
+    if total <= 0:
+        return torch.full_like(weights, 1.0 / weights.numel())
+    return weights / total
+
+
+def normalized_count_weights(context_counts: Sequence[int]) -> torch.Tensor:
+    if not context_counts:
+        raise ValueError("context_counts cannot be empty")
+    counts = torch.tensor([int(count) for count in context_counts], dtype=torch.float32)
+    if torch.any(counts <= 0):
+        raise ValueError("context_counts must be positive")
+    return _normalize_weights(counts)
+
+
+def uniform_context_weights(context_count: int) -> torch.Tensor:
+    if context_count <= 0:
+        raise ValueError("context_count must be positive")
+    return torch.full((context_count,), 1.0 / context_count, dtype=torch.float32)
+
+
+def weighted_gradient(
+    *,
+    gradients: Sequence[torch.Tensor],
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    if not gradients:
+        raise ValueError("gradients cannot be empty")
+    weights_cpu = _normalize_weights(weights)
+    if weights_cpu.shape != (len(gradients),):
+        raise ValueError("weights/gradients shape mismatch")
+    stacked = torch.stack([gradient.detach().float().cpu() for gradient in gradients], dim=0)
+    return torch.sum(stacked * weights_cpu[:, None], dim=0)
+
+
+def candidate_first_order_summaries(
+    *,
+    context_ids: tuple[int, ...],
+    context_losses: torch.Tensor,
+    gradients: Sequence[torch.Tensor],
+    mgda_weights: torch.Tensor,
+    context_counts: Sequence[int] | None = None,
+    step_size: float = 1.0,
+    tolerance: float = 1e-12,
+) -> dict[str, object]:
+    """Summarize first-order context-loss changes for candidate descent directions.
+
+    These are local linear predictions using the measured context gradients:
+        L_i(theta - eta * g_candidate) - L_i(theta)
+            ~= -eta * <g_i, g_candidate>.
+
+    They are instrumentation only; callers that need a certificate should also
+    evaluate the candidate after a virtual parameter step on a frozen probe.
+    """
+    if len(context_ids) != len(gradients):
+        raise ValueError("context ID / gradient count mismatch")
+    if context_losses.shape != (len(context_ids),):
+        raise ValueError("context loss shape mismatch")
+
+    context_count = len(context_ids)
+    losses = context_losses.detach().float().cpu()
+    gradient_matrix = torch.stack([gradient.detach().float().cpu() for gradient in gradients], dim=0)
+
+    candidates: dict[str, torch.Tensor] = {
+        "mean_context_sgd_proxy": uniform_context_weights(context_count),
+        "mgda_sgd_proxy": _normalize_weights(mgda_weights),
+    }
+    if context_counts is not None:
+        candidates["mean_example_sgd_proxy"] = normalized_count_weights(context_counts)
+
+    summaries: dict[str, object] = {}
+    old_max = float(losses.max().item())
+
+    for name, weights in candidates.items():
+        candidate_gradient = weighted_gradient(gradients=gradients, weights=weights)
+        predicted_deltas = -float(step_size) * (gradient_matrix @ candidate_gradient)
+        predicted_new_losses = losses + predicted_deltas
+        worsened = [
+            int(context_id)
+            for context_id, delta in zip(context_ids, predicted_deltas.tolist(), strict=True)
+            if float(delta) > tolerance
+        ]
+
+        summaries[name] = {
+            "weights": [float(value) for value in weights.detach().float().cpu().tolist()],
+            "gradient_norm": float(torch.linalg.vector_norm(candidate_gradient).item()),
+            "predicted_context_deltas": [
+                float(value) for value in predicted_deltas.detach().float().cpu().tolist()
+            ],
+            "predicted_context_losses": [
+                float(value) for value in predicted_new_losses.detach().float().cpu().tolist()
+            ],
+            "predicted_mean_delta": float(predicted_deltas.mean().item()),
+            "predicted_max_loss_delta": float(predicted_new_losses.max().item() - old_max),
+            "predicted_worst_context_id": int(
+                context_ids[int(torch.argmax(predicted_new_losses).item())]
+            ),
+            "predicted_worsened_context_ids": worsened,
+            "first_order_nonworsening": len(worsened) == 0,
+        }
+
+    return summaries
+
+
 def weighted_context_loss(
     *,
     context_losses: torch.Tensor,

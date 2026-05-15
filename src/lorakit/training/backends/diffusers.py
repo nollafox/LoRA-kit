@@ -26,10 +26,13 @@ from lorakit.errors import LorakitError
 from lorakit.manifest import MANIFEST_NAME, read_manifest
 from lorakit.training.backends.types import BackendResult, BackendSpec
 from lorakit.training.certified_stepper import (
+    candidate_first_order_summaries,
+    certify_losses,
     denoising_loss_per_example,
     probe_from_context_losses,
     probe_to_log_dict,
     trainable_parameters as certified_trainable_parameters,
+    weighted_gradient,
 )
 
 
@@ -46,6 +49,7 @@ PROBE_LOG_NAME = "context-probes.jsonl"
 PROBE_INITIAL_STEPS: Final = 3
 PROBE_EVERY_STEPS: Final = 25
 PROBE_MIN_FREE_CUDA_BYTES: Final = 500_000_000
+PROBE_WINDOW_TARGET_ITEMS: Final = 4
 HASH_CHUNK_SIZE_BYTES: Final = 1024 * 1024
 
 
@@ -221,7 +225,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             else None
                         ),
                         extra={
-                            "probe_version": 2,
+                            "probe_version": 3,
                             "microbatch_size": int(loss_context.noise.shape[0]),
                             "requested_batch_size": int(spec.batch_size),
                             "gradient_accumulation": int(spec.gradient_accumulation),
@@ -230,6 +234,7 @@ def train(spec: BackendSpec) -> BackendResult:
                     try:
                         _write_streaming_context_probe_if_main(
                             unet=unet,
+                            dataset=dataset,
                             batch=batch,
                             noise_scheduler=noise_scheduler,
                             weight_dtype=weight_dtype,
@@ -241,6 +246,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             requested_batch_size=spec.batch_size,
                             gradient_accumulation=spec.gradient_accumulation,
                             training_loss=loss,
+                            candidate_step_size=spec.learning_rate,
                             cuda_memory_before_probe=cuda_memory_before_probe,
                         )
                     except Exception as exc:
@@ -254,7 +260,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             status="skipped_cuda_oom",
                             free_cuda_bytes=_cuda_free_bytes(),
                             extra={
-                                "probe_version": 2,
+                                "probe_version": 3,
                                 "requested_batch_size": int(spec.batch_size),
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
@@ -269,7 +275,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             status="skipped_low_cuda_memory",
                             free_cuda_bytes=free_cuda_bytes,
                             extra={
-                                "probe_version": 2,
+                                "probe_version": 3,
                                 "requested_batch_size": int(spec.batch_size),
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
@@ -336,6 +342,14 @@ class _LossContext:
     loss: torch.Tensor
     noise: torch.Tensor
     timesteps: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _ProbeBatch:
+    batch: dict[str, object]
+    noise: torch.Tensor
+    timesteps: torch.Tensor
+    source: str
 
 
 class _DiskCachedLatentDataset(Dataset):
@@ -895,8 +909,8 @@ def _loss_context(
     )
     return _LossContext(
         loss=per_example_loss.mean(),
-        noise=noise.detach(),
-        timesteps=timesteps.detach(),
+        noise=noise.detach().cpu(),
+        timesteps=timesteps.detach().cpu(),
     )
 
 
@@ -965,6 +979,7 @@ def _jsonable_str_list(value: object) -> list[str]:
 def _probe_extra_metadata(
     *,
     batch: dict[str, object],
+    probe_batches: list[_ProbeBatch],
     noise_scheduler: DDPMScheduler,
     timesteps: torch.Tensor,
     requested_batch_size: int,
@@ -978,11 +993,38 @@ def _probe_extra_metadata(
     detached_timesteps = timesteps.detach().cpu()
     snr = _snr_for_timesteps(
         noise_scheduler=noise_scheduler,
-        timesteps=timesteps.to(device=latents.device).long(),
+        timesteps=timesteps.detach().cpu().long(),
     ).detach().float().cpu()
 
+    window_timesteps: list[int] = []
+    window_snr_values: list[float] = []
+    window_record_indices: list[int] = []
+    window_images: list[str] = []
+    window_sources: list[str] = []
+    window_latent_item_shapes: list[list[int]] = []
+
+    for probe_batch in probe_batches:
+        probe_latents = _batch_tensor(probe_batch.batch, "latents")
+        probe_timesteps = probe_batch.timesteps.detach().cpu().long()
+        probe_snr = _snr_for_timesteps(
+            noise_scheduler=noise_scheduler,
+            timesteps=probe_timesteps,
+        ).detach().float().cpu()
+
+        batch_size = int(probe_latents.shape[0])
+        window_timesteps.extend(int(item) for item in probe_timesteps.tolist())
+        window_snr_values.extend(float(item) for item in probe_snr.tolist())
+        window_record_indices.extend(_jsonable_int_list(probe_batch.batch.get("record_indices")))
+        window_images.extend(_jsonable_str_list(probe_batch.batch.get("images")))
+        window_sources.extend([probe_batch.source] * batch_size)
+        window_latent_item_shapes.extend(
+            [[int(item) for item in probe_latents.shape[1:]]] * batch_size
+        )
+
+    window_snr = torch.tensor(window_snr_values, dtype=torch.float32)
+
     return {
-        "probe_version": 2,
+        "probe_version": 3,
         "microbatch_size": int(latents.shape[0]),
         "requested_batch_size": int(requested_batch_size),
         "gradient_accumulation": int(gradient_accumulation),
@@ -1001,6 +1043,19 @@ def _probe_extra_metadata(
         "snr_max": float(snr.max().item()),
         "snr_mean": float(snr.mean().item()),
 
+        "probe_window_size": int(len(window_timesteps)),
+        "probe_window_extra_size": int(max(0, len(window_timesteps) - int(latents.shape[0]))),
+        "probe_window_batch_count": int(len(probe_batches)),
+        "probe_window_record_indices": window_record_indices,
+        "probe_window_images": window_images,
+        "probe_window_sources": window_sources,
+        "probe_window_latent_item_shapes": window_latent_item_shapes,
+        "probe_window_timesteps": window_timesteps,
+        "probe_window_snr": window_snr_values,
+        "probe_window_snr_min": float(window_snr.min().item()) if window_snr.numel() else None,
+        "probe_window_snr_max": float(window_snr.max().item()) if window_snr.numel() else None,
+        "probe_window_snr_mean": float(window_snr.mean().item()) if window_snr.numel() else None,
+
         "prediction_type": str(noise_scheduler.config.prediction_type),
         "num_train_timesteps": int(noise_scheduler.config.num_train_timesteps),
         "training_loss": float(training_loss.detach().float().cpu().item()),
@@ -1008,7 +1063,6 @@ def _probe_extra_metadata(
         "cuda_memory_before_probe": cuda_memory_before_probe,
         "cuda_memory_after_probe": _cuda_memory_snapshot(),
     }
-
 
 def _write_probe_status_if_main(
     *,
@@ -1040,6 +1094,7 @@ def _write_probe_status_if_main(
 def _write_streaming_context_probe_if_main(
     *,
     unet: UNet2DConditionModel,
+    dataset: _DiskCachedLatentDataset,
     batch: dict[str, object],
     noise_scheduler: DDPMScheduler,
     weight_dtype: torch.dtype,
@@ -1051,51 +1106,71 @@ def _write_streaming_context_probe_if_main(
     requested_batch_size: int,
     gradient_accumulation: int,
     training_loss: torch.Tensor,
+    candidate_step_size: float,
     cuda_memory_before_probe: dict[str, int] | None,
 ) -> None:
     parameters = certified_trainable_parameters(unet)
-    device_timesteps = timesteps.to(device=unet.device).long()
-    context_ids = tuple(sorted({int(value) for value in device_timesteps.detach().cpu().tolist()}))
-    context_losses: list[torch.Tensor] = []
-    gradients: list[torch.Tensor] = []
-    emitted_context_ids: list[int] = []
+    probe_batches = _build_probe_window(
+        dataset=dataset,
+        current_batch=batch,
+        current_noise=noise,
+        current_timesteps=timesteps,
+        target_items=PROBE_WINDOW_TARGET_ITEMS,
+        unet=unet,
+        noise_scheduler=noise_scheduler,
+        weight_dtype=weight_dtype,
+    )
 
-    for context_id in context_ids:
-        mask = device_timesteps == context_id
-        if not torch.any(mask):
-            continue
-        context_loss = _fixed_subset_context_loss(
-            batch=batch,
-            mask=mask,
-            unet=unet,
-            noise_scheduler=noise_scheduler,
-            weight_dtype=weight_dtype,
-            noise=noise,
-            timesteps=timesteps,
-        )
-        grads = torch.autograd.grad(
-            context_loss,
-            parameters,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=True,
-        )
-        context_losses.append(context_loss.detach().float().cpu())
-        gradients.append(_flatten_grads_from_autograd(parameters=parameters, grads=grads))
-        emitted_context_ids.append(context_id)
-        del context_loss
-        del grads
+    (
+        context_ids,
+        context_counts,
+        context_losses_tensor,
+        gradients,
+    ) = _collect_probe_context_gradients(
+        probe_batches=probe_batches,
+        unet=unet,
+        noise_scheduler=noise_scheduler,
+        weight_dtype=weight_dtype,
+        parameters=parameters,
+    )
 
-    if not should_log or not context_losses:
+    if not should_log or not gradients:
         return
 
     probe = probe_from_context_losses(
-        context_ids=tuple(emitted_context_ids),
-        context_losses=torch.stack(context_losses),
+        context_ids=context_ids,
+        context_losses=context_losses_tensor,
         gradients=gradients,
     )
+
+    first_order = candidate_first_order_summaries(
+        context_ids=context_ids,
+        context_losses=context_losses_tensor,
+        gradients=gradients,
+        mgda_weights=probe.mgda_lambda,
+        context_counts=context_counts,
+        step_size=candidate_step_size,
+    )
+    candidate_gradients = _candidate_gradients_from_probe(
+        gradients=gradients,
+        mgda_weights=probe.mgda_lambda,
+        context_counts=context_counts,
+    )
+    candidate_certificates = _candidate_step_certificates_for_probe_window(
+        unet=unet,
+        parameters=parameters,
+        probe_batches=probe_batches,
+        noise_scheduler=noise_scheduler,
+        weight_dtype=weight_dtype,
+        context_ids=context_ids,
+        old_context_losses=context_losses_tensor,
+        candidate_gradients=candidate_gradients,
+        step_size=candidate_step_size,
+    )
+
     extra = _probe_extra_metadata(
         batch=batch,
+        probe_batches=probe_batches,
         noise_scheduler=noise_scheduler,
         timesteps=timesteps,
         requested_batch_size=requested_batch_size,
@@ -1103,11 +1178,326 @@ def _write_streaming_context_probe_if_main(
         training_loss=training_loss,
         cuda_memory_before_probe=cuda_memory_before_probe,
     )
+    extra.update(
+        {
+            "context_example_counts": [int(count) for count in context_counts],
+            "candidate_step_size": float(candidate_step_size),
+            "candidate_first_order": first_order,
+            "candidate_certificates": candidate_certificates,
+        }
+    )
+
     payload = probe_to_log_dict(probe, step=step, extra=extra)
     probe_log_path.parent.mkdir(parents=True, exist_ok=True)
     with probe_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True))
         handle.write("\n")
+
+
+def _build_probe_window(
+    *,
+    dataset: _DiskCachedLatentDataset,
+    current_batch: dict[str, object],
+    current_noise: torch.Tensor,
+    current_timesteps: torch.Tensor,
+    target_items: int,
+    unet: UNet2DConditionModel,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+) -> list[_ProbeBatch]:
+    probe_batches = [
+        _ProbeBatch(
+            batch=current_batch,
+            noise=current_noise.detach().cpu(),
+            timesteps=current_timesteps.detach().cpu().long(),
+            source="training_batch",
+        )
+    ]
+    current_size = int(_batch_tensor(current_batch, "latents").shape[0])
+    extra_needed = max(0, int(target_items) - current_size)
+    if extra_needed <= 0 or len(dataset) <= 0:
+        return probe_batches
+
+    excluded = set(_jsonable_int_list(current_batch.get("record_indices")))
+    candidates = [index for index in range(len(dataset)) if index not in excluded]
+    if not candidates:
+        return probe_batches
+
+    random.shuffle(candidates)
+    for index in candidates[:extra_needed]:
+        item = dataset[index]
+        extra_batch = _collate_cached([item])
+        extra_noise, extra_timesteps = _sample_probe_noise_and_timesteps(
+            batch=extra_batch,
+            unet=unet,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+        )
+        probe_batches.append(
+            _ProbeBatch(
+                batch=extra_batch,
+                noise=extra_noise,
+                timesteps=extra_timesteps,
+                source="streamed_probe_item",
+            )
+        )
+
+    return probe_batches
+
+
+def _sample_probe_noise_and_timesteps(
+    *,
+    batch: dict[str, object],
+    unet: UNet2DConditionModel,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    latents = _batch_tensor(batch, "latents").to(device=unet.device, dtype=weight_dtype)
+    noise = torch.randn_like(latents)
+    timesteps = torch.randint(
+        0,
+        noise_scheduler.config.num_train_timesteps,
+        (latents.shape[0],),
+        device=latents.device,
+    ).long()
+    return noise.detach().cpu(), timesteps.detach().cpu()
+
+
+def _collect_probe_context_gradients(
+    *,
+    probe_batches: list[_ProbeBatch],
+    unet: UNet2DConditionModel,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    parameters: list[torch.nn.Parameter],
+) -> tuple[tuple[int, ...], list[int], torch.Tensor, list[torch.Tensor]]:
+    loss_sums: dict[int, torch.Tensor] = {}
+    gradient_sums: dict[int, torch.Tensor] = {}
+    counts: dict[int, int] = {}
+
+    for probe_batch in probe_batches:
+        device_timesteps = probe_batch.timesteps.to(device=unet.device).long()
+        local_context_ids = sorted({int(value) for value in device_timesteps.detach().cpu().tolist()})
+
+        for context_id in local_context_ids:
+            mask = device_timesteps == context_id
+            if not torch.any(mask):
+                continue
+            example_count = int(mask.sum().item())
+            context_loss = _fixed_subset_context_loss(
+                batch=probe_batch.batch,
+                mask=mask,
+                unet=unet,
+                noise_scheduler=noise_scheduler,
+                weight_dtype=weight_dtype,
+                noise=probe_batch.noise,
+                timesteps=probe_batch.timesteps,
+            )
+            grads = torch.autograd.grad(
+                context_loss,
+                parameters,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            flat_gradient = _flatten_grads_from_autograd(parameters=parameters, grads=grads)
+            weighted_loss = context_loss.detach().float().cpu() * float(example_count)
+            weighted_gradient = flat_gradient * float(example_count)
+
+            if context_id in loss_sums:
+                loss_sums[context_id] = loss_sums[context_id] + weighted_loss
+                gradient_sums[context_id] = gradient_sums[context_id] + weighted_gradient
+                counts[context_id] += example_count
+            else:
+                loss_sums[context_id] = weighted_loss
+                gradient_sums[context_id] = weighted_gradient
+                counts[context_id] = example_count
+
+            del context_loss
+            del grads
+            del flat_gradient
+
+    context_ids = tuple(sorted(loss_sums))
+    if not context_ids:
+        raise LorakitError("Context probe produced no timestep contexts")
+
+    context_counts = [int(counts[context_id]) for context_id in context_ids]
+    context_losses = torch.stack(
+        [
+            loss_sums[context_id] / float(counts[context_id])
+            for context_id in context_ids
+        ]
+    )
+    gradients = [
+        gradient_sums[context_id] / float(counts[context_id])
+        for context_id in context_ids
+    ]
+
+    return context_ids, context_counts, context_losses, gradients
+
+
+def _candidate_gradients_from_probe(
+    *,
+    gradients: list[torch.Tensor],
+    mgda_weights: torch.Tensor,
+    context_counts: list[int],
+) -> dict[str, torch.Tensor]:
+    context_count = len(gradients)
+    mean_context_weights = torch.full((context_count,), 1.0 / context_count, dtype=torch.float32)
+    count_weights = torch.tensor(context_counts, dtype=torch.float32)
+    count_weights = count_weights / count_weights.sum().clamp_min(1.0)
+
+    return {
+        "mean_context_sgd_proxy": weighted_gradient(
+            gradients=gradients,
+            weights=mean_context_weights,
+        ),
+        "mean_example_sgd_proxy": weighted_gradient(
+            gradients=gradients,
+            weights=count_weights,
+        ),
+        "mgda_sgd_proxy": weighted_gradient(
+            gradients=gradients,
+            weights=mgda_weights,
+        ),
+    }
+
+
+def _candidate_step_certificates_for_probe_window(
+    *,
+    unet: UNet2DConditionModel,
+    parameters: list[torch.nn.Parameter],
+    probe_batches: list[_ProbeBatch],
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    context_ids: tuple[int, ...],
+    old_context_losses: torch.Tensor,
+    candidate_gradients: dict[str, torch.Tensor],
+    step_size: float,
+) -> dict[str, object]:
+    snapshot = _snapshot_trainable_parameters(parameters)
+    results: dict[str, object] = {}
+
+    try:
+        for name, flat_gradient in candidate_gradients.items():
+            _restore_trainable_parameters(parameters, snapshot)
+            _apply_flat_gradient_step(
+                parameters=parameters,
+                flat_gradient=flat_gradient,
+                step_size=step_size,
+            )
+            with torch.no_grad():
+                new_context_losses = _evaluate_probe_context_losses(
+                    probe_batches=probe_batches,
+                    unet=unet,
+                    noise_scheduler=noise_scheduler,
+                    weight_dtype=weight_dtype,
+                    context_ids=context_ids,
+                )
+            certificate = certify_losses(
+                old_context_losses=old_context_losses,
+                new_context_losses=new_context_losses,
+                backtracks=0,
+                step_size=step_size,
+            )
+            deltas = (new_context_losses - old_context_losses.detach().float().cpu()).detach().float().cpu()
+            worsened = [
+                int(context_id)
+                for context_id, delta in zip(context_ids, deltas.tolist(), strict=True)
+                if float(delta) > 1e-8
+            ]
+            results[name] = {
+                "accepted": bool(certificate.accepted),
+                "reason": certificate.reason,
+                "old_mean_loss": float(certificate.old_mean_loss),
+                "new_mean_loss": float(certificate.new_mean_loss),
+                "old_max_loss": float(certificate.old_max_loss),
+                "new_max_loss": float(certificate.new_max_loss),
+                "mean_delta": float(certificate.mean_delta),
+                "max_delta": float(certificate.max_delta),
+                "step_size": float(certificate.step_size),
+                "context_deltas": [float(value) for value in deltas.tolist()],
+                "worsened_context_ids": worsened,
+            }
+    finally:
+        _restore_trainable_parameters(parameters, snapshot)
+
+    return results
+
+
+def _evaluate_probe_context_losses(
+    *,
+    probe_batches: list[_ProbeBatch],
+    unet: UNet2DConditionModel,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    context_ids: tuple[int, ...],
+) -> torch.Tensor:
+    loss_sums = {context_id: torch.tensor(0.0, dtype=torch.float32) for context_id in context_ids}
+    counts = {context_id: 0 for context_id in context_ids}
+
+    for probe_batch in probe_batches:
+        device_timesteps = probe_batch.timesteps.to(device=unet.device).long()
+        for context_id in context_ids:
+            mask = device_timesteps == int(context_id)
+            if not torch.any(mask):
+                continue
+            example_count = int(mask.sum().item())
+            loss = _fixed_subset_context_loss(
+                batch=probe_batch.batch,
+                mask=mask,
+                unet=unet,
+                noise_scheduler=noise_scheduler,
+                weight_dtype=weight_dtype,
+                noise=probe_batch.noise,
+                timesteps=probe_batch.timesteps,
+            )
+            loss_sums[context_id] = loss_sums[context_id] + loss.detach().float().cpu() * float(example_count)
+            counts[context_id] += example_count
+
+    losses: list[torch.Tensor] = []
+    for context_id in context_ids:
+        if counts[context_id] <= 0:
+            raise LorakitError(f"Probe context disappeared during candidate evaluation: {context_id}")
+        losses.append(loss_sums[context_id] / float(counts[context_id]))
+    return torch.stack(losses)
+
+
+def _snapshot_trainable_parameters(
+    parameters: list[torch.nn.Parameter],
+) -> list[torch.Tensor]:
+    return [parameter.detach().clone() for parameter in parameters]
+
+
+@torch.no_grad()
+def _restore_trainable_parameters(
+    parameters: list[torch.nn.Parameter],
+    snapshot: list[torch.Tensor],
+) -> None:
+    for parameter, value in zip(parameters, snapshot, strict=True):
+        parameter.copy_(value)
+
+
+@torch.no_grad()
+def _apply_flat_gradient_step(
+    *,
+    parameters: list[torch.nn.Parameter],
+    flat_gradient: torch.Tensor,
+    step_size: float,
+) -> None:
+    offset = 0
+    flat = flat_gradient.detach().float().cpu()
+    for parameter in parameters:
+        count = parameter.numel()
+        chunk = flat[offset : offset + count]
+        if chunk.numel() != count:
+            raise LorakitError("Flat candidate gradient is shorter than trainable parameter vector")
+        update = chunk.reshape(parameter.shape).to(device=parameter.device, dtype=parameter.dtype)
+        parameter.add_(update, alpha=-float(step_size))
+        offset += count
+    if offset != flat.numel():
+        raise LorakitError("Flat candidate gradient is longer than trainable parameter vector")
+
 
 
 def _fixed_subset_context_loss(
