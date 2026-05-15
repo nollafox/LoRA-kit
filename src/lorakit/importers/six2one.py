@@ -2,31 +2,27 @@
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import lorakit.candidates as candidates
-from lorakit.errors import ImporterMissing, LorakitError
+from lorakit.errors import LorakitError
 from lorakit.manifest import load_metadata, normalize_tags, write_json
 from lorakit.paths import Paths
 from lorakit.types import ImportResult
 
-DOCS_URL = "https://github.com/nollafox/six2one"
-
 
 def run(paths: Paths, args: list[str], *, overwrite: bool = False) -> ImportResult:
     paths.ensure()
-    if shutil.which("621") is None:
-        raise ImporterMissing(
-            "six2one is not installed. Install it with `python -m pip install six2one`; "
-            f"docs: {DOCS_URL}"
-        )
-
-    cache_dir = paths.project_root / ".lorakit" / "cache" / "621"
+    cache_dir = Path.home() / ".lorakit" / "cache" / "621"
     cache_dir.mkdir(parents=True, exist_ok=True)
     output_path = _find_output_path(args) or cache_dir
-    command = ["621", *args]
-    if "--merge" not in args and not any(arg.startswith("--merge=") for arg in args):
-        command.append("--merge")
+    command = [
+        sys.executable,
+        "-c",
+        "from six2one.cli import sync_main; sync_main()",
+        *args,
+    ]
     if "--out" not in args and not any(arg.startswith("--out=") for arg in args):
         command.extend(["--out", str(output_path)])
 
@@ -160,7 +156,7 @@ def _is_six2one_output(source_dir: Path) -> bool:
         and source_dir.is_dir()
         and (source_dir / "manifest.json").exists()
         and (source_dir / "images").is_dir()
-        and (source_dir / "posts").is_dir()
+        and (source_dir / "json").is_dir()
     )
 
 
@@ -180,7 +176,7 @@ def _import_six2one_pairs(
 
     for post_id in sorted(post_ids):
         image_source = _six2one_image_path(source_dir, post_id, manifest)
-        metadata_source = source_dir / "posts" / f"{post_id:012d}.json"
+        metadata_source = _six2one_json_path(source_dir, post_id, manifest)
         if image_source is None or not metadata_source.exists():
             continue
 
@@ -236,7 +232,7 @@ def _post_ids_for_query(source_dir: Path, args: list[str], manifest: dict[str, o
 
     config = parse_fetch_config(args)
     query = compile_query(config)
-    query_key = query_key_for(query, config.site, config.file_mode)
+    query_key = query_key_for(query, config.site)
     queries = manifest.get("queries", {})
     if query_key not in queries:
         return set()
@@ -249,8 +245,14 @@ def _post_ids_for_query(source_dir: Path, args: list[str], manifest: dict[str, o
 
 
 def _complete_six2one_post_ids(source_dir: Path) -> set[int]:
-    images = _ids_from_directory(source_dir / "images")
-    posts = _ids_from_directory(source_dir / "posts")
+    images = set()
+    images_dir = source_dir / "images"
+    if not images_dir.exists():
+        return set()
+    for child in images_dir.iterdir():
+        if child.is_dir():
+            images.update(_ids_from_directory(child))
+    posts = _ids_from_directory(source_dir / "json")
     return images & posts
 
 
@@ -270,17 +272,30 @@ def _six2one_image_path(source_dir: Path, post_id: int, manifest: dict[str, obje
     if manifest is not None:
         post_record = manifest.get("posts", {}).get(str(post_id))
         if isinstance(post_record, dict):
-            files = post_record.get("files")
-            if isinstance(files, dict):
-                for file_record in files.values():
-                    if isinstance(file_record, dict):
-                        path = file_record.get("path")
+            file_paths = post_record.get("file_paths")
+            if isinstance(file_paths, dict):
+                image_paths = file_paths.get("image_paths")
+                if isinstance(image_paths, dict):
+                    for mode in ("sample", "preview", "original"):
+                        path = image_paths.get(mode)
                         if isinstance(path, str):
                             candidate = source_dir / path
                             if candidate.exists() and candidate.is_file():
                                 return candidate
-    matches = sorted((source_dir / "images").glob(f"{post_id:012d}.*"))
+    matches = sorted((source_dir / "images").glob(f"*/{post_id:012d}.*"))
     return matches[0] if matches else None
+
+
+def _six2one_json_path(source_dir: Path, post_id: int, manifest: dict[str, object] | None) -> Path:
+    if manifest is not None:
+        post_record = manifest.get("posts", {}).get(str(post_id))
+        if isinstance(post_record, dict):
+            file_paths = post_record.get("file_paths")
+            if isinstance(file_paths, dict):
+                path = file_paths.get("json")
+                if isinstance(path, str):
+                    return source_dir / path
+    return source_dir / "json" / f"{post_id:012d}.json"
 
 
 def _source_site(args: list[str]) -> str:

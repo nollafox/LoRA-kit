@@ -34,6 +34,18 @@ test-trackers = ["comet-ml", "dvclive", "matplotlib", "swanlab[dashboard]", "ten
 testing = ["bitsandbytes", "datasets", "diffusers", "evaluate", "parameterized", "pytest (>=7.2.0)", "pytest-order", "pytest-subtests", "pytest-xdist", "scikit-learn", "scipy", "timm", "torchdata (>=0.8.0)", "torchpippy (>=0.2.0)", "tqdm", "transformers"]
 
 [[package]]
+name = "aiofiles"
+version = "25.1.0"
+description = "File support for asyncio."
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "aiofiles-25.1.0-py3-none-any.whl", hash = "sha256:abe311e527c862958650f9438e859c1fa7568a141b22abcd015e120e86a85695"},
+    {file = "aiofiles-25.1.0.tar.gz", hash = "sha256:a8d728f0a29de45dc521f18f07297428d56992a742f0cd2701ba86e44d23d5b2"},
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
 description = "Happy Eyeballs for asyncio"
@@ -3226,6 +3238,23 @@ files = [
 ]
 
 [[package]]
+name = "six2one"
+version = "0.2.0"
+description = "Manifest-backed e621/e926 dataset fetching from tiny numeric commands."
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "six2one-0.2.0-py3-none-any.whl", hash = "sha256:3876f4369ca156237c0ac030e9c1e551174fbd1730e8ed4358ca839f24665c1c"},
+    {file = "six2one-0.2.0.tar.gz", hash = "sha256:5910b55509d63499426b47925d94b32cd1c43877ef5bd3280553ce72be5dc728"},
+]
+
+[package.dependencies]
+aiofiles = ">=25.1.0,<26.0.0"
+aiohttp = ">=3.13.5,<4.0.0"
+tqdm = ">=4.67.3,<5.0.0"
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 description = "Computer algebra system (CAS) in Python"
@@ -3987,4 +4016,4 @@ accel = ["xformers"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.13"
-content-hash = "980a58c6c092a86a1933eac07001f765acc9acdb5d78aa0f2b1e3cd9ed4cec79"
+content-hash = "405594b106f1e3a3e4f1eea2cdabcbc53d1d08e38962456dc9f8f0557a8520db"

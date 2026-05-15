@@ -16,7 +16,6 @@ from lorakit.cli import main
 from lorakit.errors import (
     DatasetExists,
     DatasetNotFound,
-    ImporterMissing,
     InvalidPrepareConfig,
     ModelAmbiguous,
     LorakitError,
@@ -1126,7 +1125,7 @@ def test_dataset_delete_preserves_artifacts(tmp_path):
     assert not paths.staged_for("ds").exists()
 
 
-def test_importer_imports_pairs_skips_existing_and_reports_missing_binary(tmp_path, monkeypatch):
+def test_importer_imports_pairs_and_skips_existing(tmp_path, monkeypatch):
     paths = Paths(tmp_path / "data")
     source = tmp_path / "download"
     _image(source / "0001.png")
@@ -1145,11 +1144,6 @@ def test_importer_imports_pairs_skips_existing_and_reports_missing_binary(tmp_pa
 
     second = six2one.import_pairs(paths, source)
     assert sorted(path.name for path in second.skipped) == ["0001.json", "0001.png"]
-
-    monkeypatch.setattr(six2one.shutil, "which", lambda command: None)
-    with pytest.raises(ImporterMissing):
-        six2one.run(paths, ["fox"], overwrite=False)
-
 
 def test_importer_overwrite_replaces_existing_files(tmp_path):
     paths = Paths(tmp_path / "data")
@@ -1174,12 +1168,8 @@ def test_importer_run_shells_out_and_copies_results(tmp_path, monkeypatch):
 
     def fake_run(command, *, check):
         out_dir = Path(command[-1])
-        image_dir = out_dir / "images"
-        post_dir = out_dir / "posts"
-        _image(image_dir / "000000000001.png")
-        _six2one_metadata(post_dir / "000000000001.json", post_id=1)
+        _six2one_output_post(out_dir, 1)
 
-    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
     result = six2one.run(paths, ["fox", "--safe"], overwrite=False)
@@ -1187,9 +1177,8 @@ def test_importer_run_shells_out_and_copies_results(tmp_path, monkeypatch):
     assert sorted(path.name for path in result.imported) == ["000000000001.json", "000000000001.png"]
 
 
-def test_importer_run_uses_persistent_621_cache_and_merge(tmp_path, monkeypatch):
+def test_importer_run_uses_shared_621_cache(tmp_path, monkeypatch):
     paths = Paths(tmp_path / "data")
-    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.Path, "home", lambda: tmp_path)
 
     captured: dict[str, list[str] | Path] = {}
@@ -1198,16 +1187,18 @@ def test_importer_run_uses_persistent_621_cache_and_merge(tmp_path, monkeypatch)
         captured["command"] = command
         out_index = command.index("--out") + 1
         out_dir = Path(command[out_index])
-        image_dir = out_dir / "images"
-        post_dir = out_dir / "posts"
-        _image(image_dir / "000000000001.png")
-        _six2one_metadata(post_dir / "000000000001.json", post_id=1)
+        _six2one_output_post(out_dir, 1)
 
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
     result = six2one.run(paths, ["fox"], overwrite=False)
 
-    assert "--merge" in captured["command"]
+    assert captured["command"][:3] == [
+        six2one.sys.executable,
+        "-c",
+        "from six2one.cli import sync_main; sync_main()",
+    ]
+    assert "--merge" not in captured["command"]
     assert "--out" in captured["command"]
     assert captured["command"][captured["command"].index("--out") + 1] == str(
         tmp_path / ".lorakit" / "cache" / "621"
@@ -1217,16 +1208,10 @@ def test_importer_run_uses_persistent_621_cache_and_merge(tmp_path, monkeypatch)
 
 def test_importer_run_imports_only_new_persistent_cache_pairs(tmp_path, monkeypatch):
     paths = Paths(tmp_path / "data")
-    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.Path, "home", lambda: tmp_path)
 
     cache_dir = tmp_path / ".lorakit" / "cache" / "621"
-    image_dir = cache_dir / "images"
-    post_dir = cache_dir / "posts"
-    image_dir.mkdir(parents=True)
-    post_dir.mkdir(parents=True)
-    _image(image_dir / "000000000001.png")
-    _six2one_metadata(post_dir / "000000000001.json", post_id=1)
+    _six2one_output_post(cache_dir, 1)
 
     manifest_path = cache_dir / "manifest.json"
     manifest_path.write_text("{}", encoding="utf-8")
@@ -1239,10 +1224,7 @@ def test_importer_run_imports_only_new_persistent_cache_pairs(tmp_path, monkeypa
 
     def fake_run(command, *, check):
         out_dir = Path(command[command.index("--out") + 1])
-        image_dir = out_dir / "images"
-        post_dir = out_dir / "posts"
-        _image(image_dir / "000000000002.png")
-        _six2one_metadata(post_dir / "000000000002.json", post_id=2)
+        _six2one_output_post(out_dir, 2)
 
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
@@ -1259,12 +1241,8 @@ def test_importer_run_preserves_site_in_candidate_metadata(tmp_path, monkeypatch
 
     def fake_run(command, *, check):
         out_dir = Path(command[-1])
-        image_dir = out_dir / "images"
-        post_dir = out_dir / "posts"
-        _image(image_dir / "000000000001.png")
-        _six2one_metadata(post_dir / "000000000001.json", post_id=1)
+        _six2one_output_post(out_dir, 1)
 
-    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
     six2one.run(paths, ["fox", "--site", "e926"], overwrite=False)
@@ -1279,7 +1257,6 @@ def test_importer_run_converts_command_failure_to_domain_error(tmp_path, monkeyp
     def fake_run(command, *, check):
         raise six2one.subprocess.CalledProcessError(returncode=2, cmd=command)
 
-    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
     with pytest.raises(LorakitError, match="six2one import failed"):
@@ -1329,7 +1306,6 @@ def test_cli_import_extracts_trailing_data_dir_from_importer_args(tmp_path, monk
         _image(out_dir / "0001.png")
         _six2one_metadata(out_dir / "0001.json", post_id=1)
 
-    monkeypatch.setattr(six2one.shutil, "which", lambda command: "/bin/621")
     monkeypatch.setattr(six2one.subprocess, "run", fake_run)
 
     assert main(["candidates", "import", "621", "fox", "--data-dir", str(data_dir)]) == 0
@@ -1773,6 +1749,44 @@ def _six2one_metadata(
         },
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _six2one_output_post(output_dir: Path, post_id: int) -> None:
+    image_path = output_dir / "images" / "sample" / f"{post_id:012d}.png"
+    metadata_path = output_dir / "json" / f"{post_id:012d}.json"
+    _image(image_path)
+    _six2one_metadata(metadata_path, post_id=post_id)
+    manifest_path = output_dir / "manifest.json"
+    manifest = {
+        "schema_version": 3,
+        "tool": {"name": "six2one", "version": "0.1.2"},
+        "sources": {"e621": {"base_url": "https://e621.net"}},
+        "output": {"root": str(output_dir), "root_absolute": str(output_dir.resolve())},
+        "queries": {
+            "e621:fox": {
+                "key": "e621:fox",
+                "compiled": "fox",
+                "downloaded_count": 1,
+                "last_post_id": post_id,
+                "seen_post_ids": [post_id],
+            },
+        },
+        "posts": {
+            str(post_id): {
+                "id": str(post_id),
+                "file_paths": {
+                    "json": f"json/{post_id:012d}.json",
+                    "image_paths": {
+                        "preview": None,
+                        "sample": f"images/sample/{post_id:012d}.png",
+                        "original": None,
+                    },
+                },
+            },
+        },
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
 class FakeTagger:

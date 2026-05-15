@@ -26,7 +26,8 @@ dependencies = [
     "scipy (>=1.17.1,<2.0.0)",
     "fairscale (>=0.4.13,<0.5.0)",
     "easyocr (>=1.7.2,<2.0.0)",
-    "opencv-python (>=4.13.0.92,<5.0.0.0)"
+    "opencv-python (>=4.13.0.92,<5.0.0.0)",
+    "six2one (==0.2.0)"
 ]
 
 [project.optional-dependencies]

@@ -47,7 +47,7 @@ $ lorakit train fox-solo --model sd15
 
 The result is `data/artifacts/fox-solo/run-001/model.safetensors`, with a snapshot of the prepared inputs sitting next to it.
 
-The `candidates import 621` step requires [six2one](https://github.com/nollafox/six2one), installable via `python -m pip install six2one`. `xformers` is optional; install `lorakit[accel]` on platforms where you want that acceleration and compatible wheels are available.
+The `candidates import 621` step uses LoRA-kit's pinned [six2one](https://github.com/nollafox/six2one) dependency, so it does not depend on whichever `621` command happens to be installed globally. `xformers` is optional; install `lorakit[accel]` on platforms where you want that acceleration and compatible wheels are available.
 
 For an isolated install, use `pipx install lorakit`. For an editable install from a local clone, run `python -m pip install --user -e .`.
 
@@ -157,7 +157,7 @@ $ lorakit candidates import 621 fox solo --safe --limit 100 [--overwrite]
 
 `candidates import` is how source material enters the pool. The first positional argument names the importer, and the rest are passed straight to it. The only importer in this build is `621`, which wraps [six2one](https://github.com/nollafox/six2one) and accepts the same tag query you would type into e621's search bar.
 
-The importer runs in a temporary directory, then its image-and-JSON pairs are copied into `data/candidates/`. Files that already exist with the same stem are skipped silently — pass `--overwrite` to replace them. If `six2one` is not on your `PATH`, lorakit exits with installation guidance.
+The importer runs LoRA-kit's pinned six2one dependency in the current Python environment, uses the shared cache under `~/.lorakit/cache/621`, then copies matching image-and-JSON pairs into `data/candidates/`. Files that already exist with the same stem are skipped silently — pass `--overwrite` to replace them.
 
 Candidate stems are global within `data/candidates/`. The `621` importer uses e621 post IDs, which are already unique. Future importers from sources without natural unique IDs should prefix their stems (`local_IMG_0001`, say) to avoid collisions.
 
