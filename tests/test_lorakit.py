@@ -1158,6 +1158,129 @@ def test_diffusers_pixel_shape_cache_batches_group_compatible_images(tmp_path):
         assert len(shapes) == 1
 
 
+def test_diffusers_adaptive_cuda_batches_retries_smaller_batches(monkeypatch):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    calls = []
+
+    def encode_batch(indices):
+        calls.append(list(indices))
+        if len(indices) > 1:
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(diffusers_backend, "_cleanup_after_cuda_oom", lambda: None)
+
+    diffusers_backend._adaptive_cuda_batches(
+        indices=[0, 1, 2],
+        initial_batch_size=4,
+        encode_batch=encode_batch,
+    )
+
+    assert calls == [[0, 1, 2], [0, 1], [0], [1], [2]]
+
+
+def test_diffusers_adaptive_cuda_batches_preserves_index_order():
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    encoded = []
+
+    def encode_batch(indices):
+        encoded.extend(indices)
+
+    diffusers_backend._adaptive_cuda_batches(
+        indices=[3, 1, 2, 0],
+        initial_batch_size=2,
+        encode_batch=encode_batch,
+    )
+
+    assert encoded == [3, 1, 2, 0]
+
+
+def test_diffusers_adaptive_cuda_batches_reports_single_item_oom(monkeypatch):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    def encode_batch(indices):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(diffusers_backend, "_cleanup_after_cuda_oom", lambda: None)
+
+    with pytest.raises(LorakitError, match="single cache item"):
+        diffusers_backend._adaptive_cuda_batches(
+            indices=[0],
+            initial_batch_size=1,
+            encode_batch=encode_batch,
+        )
+
+
+def test_diffusers_probe_scheduler_uses_initial_cadence_and_memory(monkeypatch):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    assert diffusers_backend._should_probe_contexts(global_step=0, sync_gradients=True)
+    assert diffusers_backend._should_probe_contexts(global_step=2, sync_gradients=True)
+    assert not diffusers_backend._should_probe_contexts(global_step=3, sync_gradients=True)
+    assert not diffusers_backend._should_probe_contexts(global_step=25, sync_gradients=False)
+
+    monkeypatch.setattr(diffusers_backend, "_cuda_free_bytes", lambda: 2_000_000_000)
+    assert diffusers_backend._should_probe_contexts(global_step=25, sync_gradients=True)
+
+    monkeypatch.setattr(diffusers_backend, "_cuda_free_bytes", lambda: 1)
+    assert not diffusers_backend._should_probe_contexts(global_step=25, sync_gradients=True)
+
+
+def test_diffusers_streaming_probe_does_not_mutate_existing_grads(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    class FakeSchedulerConfig:
+        num_train_timesteps = 10
+        prediction_type = "epsilon"
+
+    class FakeScheduler:
+        config = FakeSchedulerConfig()
+
+        def add_noise(self, latents, noise, timesteps):
+            return latents + noise
+
+    class FakeUnet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+        @property
+        def device(self):
+            return self.weight.device
+
+        def forward(self, noisy_latents, timesteps, encoder_hidden_states, return_dict=False):
+            del timesteps
+            prediction = noisy_latents * self.weight + encoder_hidden_states
+            return (prediction,)
+
+    unet = FakeUnet()
+    batch = {
+        "latents": torch.ones(2, 1, 1, 1),
+        "encoder_hidden_states": torch.zeros(2, 1, 1, 1),
+    }
+    noise = torch.zeros(2, 1, 1, 1)
+    timesteps = torch.tensor([1, 2])
+    unet.weight.grad = torch.tensor(123.0)
+
+    diffusers_backend._write_streaming_context_probe_if_main(
+        unet=unet,
+        batch=batch,
+        noise_scheduler=FakeScheduler(),
+        weight_dtype=torch.float32,
+        noise=noise,
+        timesteps=timesteps,
+        probe_log_path=tmp_path / "probe.jsonl",
+        step=7,
+        should_log=True,
+    )
+
+    assert float(unet.weight.grad.item()) == pytest.approx(123.0)
+    payload = json.loads((tmp_path / "probe.jsonl").read_text(encoding="utf-8"))
+    assert payload["step"] == 7
+    assert payload["context_ids"] == [1, 2]
+
+
 def test_certified_stepper_projects_to_simplex():
     from lorakit.training import certified_stepper
 

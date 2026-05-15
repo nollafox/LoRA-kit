@@ -26,8 +26,6 @@ from lorakit.errors import LorakitError
 from lorakit.manifest import MANIFEST_NAME, read_manifest
 from lorakit.training.backends.types import BackendResult, BackendSpec
 from lorakit.training.certified_stepper import (
-    context_gradients,
-    context_losses_from_examples,
     denoising_loss_per_example,
     probe_from_context_losses,
     probe_to_log_dict,
@@ -40,10 +38,14 @@ LORA_WEIGHTS_NAME = "pytorch_lora_weights.safetensors"
 MAX_GRAD_NORM = 1.0
 LR_WARMUP_STEPS = 0
 VAE_DOWNSAMPLE_FACTOR: Final = 8
-CACHE_ENCODING_BATCH_SIZE: Final = 4
+CACHE_ENCODING_MAX_BATCH_SIZE: Final = 4
+CACHE_ENCODING_MIN_BATCH_SIZE: Final = 1
 CACHE_DIR_NAME: Final = "tensor-cache"
 CACHE_MANIFEST_NAME: Final = "manifest.json"
 PROBE_LOG_NAME: Final = "context-probes.jsonl"
+PROBE_INITIAL_STEPS: Final = 3
+PROBE_EVERY_STEPS: Final = 25
+PROBE_MIN_FREE_CUDA_BYTES: Final = 1_000_000_000
 HASH_CHUNK_SIZE_BYTES: Final = 1024 * 1024
 
 
@@ -203,15 +205,45 @@ def train(spec: BackendSpec) -> BackendResult:
                     weight_dtype=weight_dtype,
                 )
                 loss = loss_context.loss
-                _write_context_probe_if_main(
-                    unet=unet,
-                    loss_context=loss_context,
-                    probe_log_path=probe_log_path,
-                    step=global_step,
-                    should_probe=accelerator.sync_gradients,
-                    should_log=accelerator.is_local_main_process,
-                )
                 accelerator.backward(loss)
+                should_probe = _should_probe_contexts(
+                    global_step=global_step,
+                    sync_gradients=accelerator.sync_gradients,
+                )
+                if should_probe:
+                    try:
+                        _write_streaming_context_probe_if_main(
+                            unet=unet,
+                            batch=batch,
+                            noise_scheduler=noise_scheduler,
+                            weight_dtype=weight_dtype,
+                            noise=loss_context.noise,
+                            timesteps=loss_context.timesteps,
+                            probe_log_path=probe_log_path,
+                            step=global_step,
+                            should_log=accelerator.is_local_main_process,
+                        )
+                    except Exception as exc:
+                        if not _is_cuda_oom(exc):
+                            raise
+                        _cleanup_after_cuda_oom()
+                        _write_probe_status_if_main(
+                            probe_log_path=probe_log_path,
+                            step=global_step,
+                            should_log=accelerator.is_local_main_process,
+                            status="skipped_cuda_oom",
+                            free_cuda_bytes=_cuda_free_bytes(),
+                        )
+                elif accelerator.sync_gradients and accelerator.is_local_main_process:
+                    free_cuda_bytes = _cuda_free_bytes()
+                    if free_cuda_bytes is not None and free_cuda_bytes < PROBE_MIN_FREE_CUDA_BYTES:
+                        _write_probe_status_if_main(
+                            probe_log_path=probe_log_path,
+                            step=global_step,
+                            should_log=True,
+                            status="skipped_low_cuda_memory",
+                            free_cuda_bytes=free_cuda_bytes,
+                        )
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
                         [parameter for parameter in unet.parameters() if parameter.requires_grad],
@@ -271,8 +303,8 @@ class _CacheRecord:
 @dataclass(frozen=True)
 class _LossContext:
     loss: torch.Tensor
-    context_ids: tuple[int, ...]
-    context_losses: torch.Tensor
+    noise: torch.Tensor
+    timesteps: torch.Tensor
 
 
 class _DiskCachedLatentDataset(Dataset):
@@ -483,6 +515,44 @@ def _weight_dtype(accelerator: Accelerator) -> torch.dtype:
     return torch.float32
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "cuda out of memory" in str(exc).lower()
+
+
+def _cleanup_after_cuda_oom() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def _adaptive_cuda_batches(
+    *,
+    indices: list[int],
+    initial_batch_size: int,
+    encode_batch,
+) -> None:
+    batch_size = max(CACHE_ENCODING_MIN_BATCH_SIZE, int(initial_batch_size))
+    cursor = 0
+    while cursor < len(indices):
+        current = indices[cursor : cursor + batch_size]
+        try:
+            encode_batch(current)
+            cursor += len(current)
+        except Exception as exc:
+            if not _is_cuda_oom(exc):
+                raise
+            _cleanup_after_cuda_oom()
+            if batch_size <= CACHE_ENCODING_MIN_BATCH_SIZE:
+                raise LorakitError(
+                    "CUDA out of memory while encoding a single cache item. "
+                    "Try closing other GPU processes or preparing at a smaller resolution."
+                ) from exc
+            batch_size = max(CACHE_ENCODING_MIN_BATCH_SIZE, batch_size // 2)
+
+
 @torch.no_grad()
 def _cache_encoder_hidden_states(
     *,
@@ -498,25 +568,38 @@ def _cache_encoder_hidden_states(
     text_encoder.requires_grad_(False)
     text_encoder.to(device=device, dtype=dtype)
     text_encoder.eval()
-    cached: list[Path] = []
-    for batch_start in tqdm(
-        range(0, len(rows), CACHE_ENCODING_BATCH_SIZE),
-        desc="Encoding captions",
-    ):
-        batch_rows = rows[batch_start : batch_start + CACHE_ENCODING_BATCH_SIZE]
+    cached: list[Path | None] = [None] * len(rows)
+    progress = tqdm(total=len(rows), desc="Encoding captions")
+
+    def encode_batch(batch_indices: list[int]) -> None:
         tokens = tokenizer(
-            [row.caption for row in batch_rows],
+            [rows[index].caption for index in batch_indices],
             max_length=tokenizer.model_max_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
         ).input_ids.to(device)
         hidden = text_encoder(tokens, return_dict=False)[0]
-        for offset, tensor in enumerate(hidden):
-            path = text_cache_dir / f"{batch_start + offset:08d}.pt"
+        for index, tensor in zip(batch_indices, hidden, strict=True):
+            path = text_cache_dir / f"{index:08d}.pt"
             _save_tensor(path, tensor.detach().to(dtype=dtype).cpu())
-            cached.append(path)
-    return cached
+            cached[index] = path
+        progress.update(len(batch_indices))
+        del tokens
+        del hidden
+
+    try:
+        _adaptive_cuda_batches(
+            indices=list(range(len(rows))),
+            initial_batch_size=CACHE_ENCODING_MAX_BATCH_SIZE,
+            encode_batch=encode_batch,
+        )
+    finally:
+        progress.close()
+
+    if any(path is None for path in cached):
+        raise LorakitError("Text embedding cache did not encode every row")
+    return [path for path in cached if path is not None]
 
 
 @torch.no_grad()
@@ -539,11 +622,11 @@ def _cache_latents(
     vae.requires_grad_(False)
     vae.to(device=device, dtype=dtype)
     vae.eval()
-    cached: list[Path] = []
-    for batch_indices in tqdm(
-        _pixel_shape_cache_batches(rows),
-        desc="Encoding latents",
-    ):
+    cached: list[Path | None] = [None] * len(rows)
+    shape_buckets = _pixel_shape_buckets(rows)
+    progress = tqdm(total=len(rows), desc="Encoding latents")
+
+    def encode_batch(batch_indices: list[int]) -> None:
         pixel_batches: list[torch.Tensor] = []
         for index in batch_indices:
             with Image.open(rows[index].image_path) as image:
@@ -554,19 +637,40 @@ def _cache_latents(
         for index, tensor in zip(batch_indices, latents, strict=True):
             path = latent_cache_dir / f"{index:08d}.pt"
             _save_tensor(path, tensor.detach().to(dtype=dtype).cpu())
-            cached.append(path)
-    cached.sort()
-    return cached
+            cached[index] = path
+        progress.update(len(batch_indices))
+        del pixel_batches
+        del pixel_values
+        del latents
+
+    try:
+        for indices in shape_buckets.values():
+            _adaptive_cuda_batches(
+                indices=indices,
+                initial_batch_size=CACHE_ENCODING_MAX_BATCH_SIZE,
+                encode_batch=encode_batch,
+            )
+    finally:
+        progress.close()
+
+    if any(path is None for path in cached):
+        raise LorakitError("Latent cache did not encode every row")
+    return [path for path in cached if path is not None]
 
 
-def _pixel_shape_cache_batches(rows: list[_TrainingRow]) -> list[list[int]]:
+def _pixel_shape_buckets(rows: list[_TrainingRow]) -> dict[tuple[int, int], list[int]]:
     buckets: dict[tuple[int, int], list[int]] = {}
     for index, row in enumerate(rows):
         buckets.setdefault((row.width, row.height), []).append(index)
+    return buckets
+
+
+def _pixel_shape_cache_batches(rows: list[_TrainingRow]) -> list[list[int]]:
+    buckets = _pixel_shape_buckets(rows)
     batches: list[list[int]] = []
     for indices in buckets.values():
-        for start in range(0, len(indices), CACHE_ENCODING_BATCH_SIZE):
-            batches.append(indices[start : start + CACHE_ENCODING_BATCH_SIZE])
+        for start in range(0, len(indices), CACHE_ENCODING_MAX_BATCH_SIZE):
+            batches.append(indices[start : start + CACHE_ENCODING_MAX_BATCH_SIZE])
     return batches
 
 
@@ -737,39 +841,101 @@ def _loss_context(
         model_pred=prediction,
         target=target,
     )
-    context_ids, context_losses = context_losses_from_examples(
-        per_example_loss=per_example_loss,
-        timesteps=timesteps,
-    )
     return _LossContext(
         loss=per_example_loss.mean(),
-        context_ids=context_ids,
-        context_losses=context_losses,
+        noise=noise.detach(),
+        timesteps=timesteps.detach(),
     )
 
 
-def _write_context_probe_if_main(
+def _should_probe_contexts(*, global_step: int, sync_gradients: bool) -> bool:
+    if not sync_gradients:
+        return False
+    if global_step < PROBE_INITIAL_STEPS:
+        return True
+    if global_step % PROBE_EVERY_STEPS != 0:
+        return False
+    free_bytes = _cuda_free_bytes()
+    if free_bytes is not None and free_bytes < PROBE_MIN_FREE_CUDA_BYTES:
+        return False
+    return True
+
+
+def _cuda_free_bytes() -> int | None:
+    if not torch.cuda.is_available():
+        return None
+    free, _total = torch.cuda.mem_get_info()
+    return int(free)
+
+
+def _write_probe_status_if_main(
     *,
-    unet: UNet2DConditionModel,
-    loss_context: _LossContext,
     probe_log_path: Path,
     step: int,
-    should_probe: bool,
     should_log: bool,
+    status: str,
+    free_cuda_bytes: int | None,
 ) -> None:
-    if not should_probe:
-        return
-    parameters = certified_trainable_parameters(unet)
-    gradients = context_gradients(
-        context_losses=loss_context.context_losses,
-        parameters=parameters,
-        retain_graph=True,
-    )
     if not should_log:
         return
+    payload = {
+        "step": int(step),
+        "probe_status": status,
+        "free_cuda_bytes": free_cuda_bytes,
+    }
+    probe_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with probe_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True))
+        handle.write("\n")
+
+
+def _write_streaming_context_probe_if_main(
+    *,
+    unet: UNet2DConditionModel,
+    batch: dict[str, torch.Tensor],
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+    probe_log_path: Path,
+    step: int,
+    should_log: bool,
+) -> None:
+    parameters = certified_trainable_parameters(unet)
+    device_timesteps = timesteps.to(device=unet.device).long()
+    context_ids = tuple(sorted({int(value) for value in device_timesteps.detach().cpu().tolist()}))
+    context_losses: list[torch.Tensor] = []
+    gradients: list[torch.Tensor] = []
+    for context_id in context_ids:
+        mask = device_timesteps == context_id
+        if not torch.any(mask):
+            continue
+        context_loss = _fixed_subset_context_loss(
+            batch=batch,
+            mask=mask,
+            unet=unet,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+            noise=noise,
+            timesteps=timesteps,
+        )
+        grads = torch.autograd.grad(
+            context_loss,
+            parameters,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+        context_losses.append(context_loss.detach().float().cpu())
+        gradients.append(_flatten_grads_from_autograd(parameters=parameters, grads=grads))
+        del context_loss
+        del grads
+
+    if not should_log or not context_losses:
+        return
     probe = probe_from_context_losses(
-        context_ids=loss_context.context_ids,
-        context_losses=loss_context.context_losses,
+        context_ids=context_ids,
+        context_losses=torch.stack(context_losses),
         gradients=gradients,
     )
     payload = probe_to_log_dict(probe, step=step)
@@ -777,6 +943,58 @@ def _write_context_probe_if_main(
     with probe_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True))
         handle.write("\n")
+
+
+def _fixed_subset_context_loss(
+    *,
+    batch: dict[str, torch.Tensor],
+    mask: torch.Tensor,
+    unet: UNet2DConditionModel,
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    latents = batch["latents"].to(device=unet.device, dtype=weight_dtype)[mask]
+    encoder_hidden_states = batch["encoder_hidden_states"].to(
+        device=unet.device,
+        dtype=weight_dtype,
+    )[mask]
+    local_noise = noise.to(device=unet.device, dtype=weight_dtype)[mask]
+    local_timesteps = timesteps.to(device=unet.device).long()[mask]
+    noisy_latents = noise_scheduler.add_noise(latents, local_noise, local_timesteps)
+    target = _target(
+        noise_scheduler=noise_scheduler,
+        latents=latents,
+        noise=local_noise,
+        timesteps=local_timesteps,
+    )
+    prediction = unet(
+        noisy_latents,
+        local_timesteps,
+        encoder_hidden_states,
+        return_dict=False,
+    )[0]
+    return denoising_loss_per_example(
+        model_pred=prediction,
+        target=target,
+    ).mean()
+
+
+def _flatten_grads_from_autograd(
+    *,
+    parameters: list[torch.nn.Parameter],
+    grads: tuple[torch.Tensor | None, ...],
+) -> torch.Tensor:
+    pieces: list[torch.Tensor] = []
+    for parameter, grad in zip(parameters, grads, strict=True):
+        if grad is None:
+            pieces.append(torch.zeros(parameter.numel(), dtype=torch.float32))
+        else:
+            pieces.append(grad.detach().float().reshape(-1).cpu())
+    if not pieces:
+        raise LorakitError("No trainable parameters found for context probe")
+    return torch.cat(pieces, dim=0)
 
 
 def _target(
