@@ -1786,6 +1786,92 @@ def test_diffusers_lora_partition_and_ratio_application():
     assert module.lora_B.weight.grad.item() == pytest.approx(3.0)
 
 
+def test_diffusers_noop_rank_growth_preserves_lora_output_and_weights():
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    class FakeLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(3, 2, bias=False)})
+            self.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 4, bias=False)})
+            self.r = {"default": 2}
+            self.lora_alpha = {"default": 2}
+            self.scaling = {"default": 1.0}
+
+        def forward(self, x):
+            return self.lora_B["default"](self.lora_A["default"](x)) * self.scaling["default"]
+
+    layer = FakeLayer()
+    with torch.no_grad():
+        layer.lora_A["default"].weight.copy_(torch.arange(6, dtype=torch.float32).reshape(2, 3))
+        layer.lora_B["default"].weight.copy_(torch.arange(8, dtype=torch.float32).reshape(4, 2))
+    before_a = layer.lora_A["default"].weight.detach().clone()
+    before_b = layer.lora_B["default"].weight.detach().clone()
+    x = torch.randn(5, 3)
+    before = layer(x).detach().clone()
+
+    assert diffusers_backend._grow_lora_layer_noop(layer=layer, adapter="default", growth=2)
+
+    after = layer(x).detach()
+    assert torch.allclose(after, before)
+    assert layer.lora_A["default"].out_features == 4
+    assert layer.lora_B["default"].in_features == 4
+    assert torch.allclose(layer.lora_A["default"].weight[:2], before_a)
+    assert torch.allclose(layer.lora_B["default"].weight[:, :2], before_b)
+    assert torch.count_nonzero(layer.lora_A["default"].weight[2:]).item() == 0
+    assert torch.count_nonzero(layer.lora_B["default"].weight[:, 2:]).item() == 0
+    assert layer.lora_A["default"].weight.requires_grad
+    assert layer.lora_B["default"].weight.requires_grad
+
+
+def test_diffusers_rank_growth_report_skips_when_signal_below_noise():
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    class FakeLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 2, bias=False)})
+            self.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 2, bias=False)})
+
+    layer = FakeLayer()
+    with torch.no_grad():
+        layer.lora_A["default"].weight.fill_(1.0)
+        layer.lora_B["default"].weight.fill_(1.0)
+    layer.lora_A["default"].weight.grad = torch.ones_like(layer.lora_A["default"].weight)
+    layer.lora_B["default"].weight.grad = -torch.ones_like(layer.lora_B["default"].weight)
+
+    report = diffusers_backend._rank_growth_report_for_layer(name="fake", layer=layer)
+
+    assert report["residual_rank"] == 0
+    assert report["rank_growth"] == 0
+
+
+def test_diffusers_rank_growth_skips_when_memory_is_low(monkeypatch):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    module = torch.nn.Module()
+    monkeypatch.setattr(diffusers_backend, "_cuda_free_bytes", lambda: 1)
+
+    report = diffusers_backend._maybe_grow_lora_rank(
+        unet=module,
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.tensor(1.0))], lr=0.1),
+        validation_skeleton=diffusers_backend._ValidationSkeleton(items=()),
+        baseline_report=diffusers_backend._ValidationReport(
+            step=1,
+            loss_mean=1.0,
+            loss_max_snr_bucket=1.0,
+            loss_by_snr_bucket={"mid": 1.0},
+            item_count=1,
+        ),
+        noise_scheduler=None,
+        weight_dtype=torch.float32,
+        should_probe=True,
+    )
+
+    assert report["rank_growth_skipped_memory"] is True
+    assert report["rank_growth_accepted"] is False
+
+
 def test_diffusers_cache_manifest_records_deterministic_latent_mode(tmp_path):
     from lorakit.training.backends import diffusers as diffusers_backend
 
