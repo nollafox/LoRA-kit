@@ -22,6 +22,23 @@ class ContextProbe:
     negative_cosine_fraction: float
     min_pairwise_cosine: float
 
+    # Dual/context instrumentation.
+    context_count: int
+    lambda_support: int
+    lambda_entropy_bits: float
+    lambda_max: float
+    lambda_min_positive: float
+    lambda_weighted_loss: float
+    loss_min: float
+    loss_range: float
+    max_loss_context_id: int
+    max_lambda_context_id: int
+    pair_count: int
+    negative_pair_count: int
+    mean_pairwise_cosine: float
+    max_pairwise_cosine: float
+    most_conflicting_pair: tuple[int, int] | None
+
 
 @dataclass(frozen=True)
 class StepCertificate:
@@ -199,6 +216,51 @@ def cosine_from_gram(gram: torch.Tensor) -> torch.Tensor:
     return torch.clamp(cosine, min=-1.0, max=1.0)
 
 
+def _lambda_entropy_bits(weights: torch.Tensor) -> float:
+    positive = weights.detach().float().cpu()
+    positive = positive[positive > 0]
+    if positive.numel() == 0:
+        return 0.0
+    return float(-(positive * torch.log2(positive)).sum().item())
+
+
+def _lambda_min_positive(weights: torch.Tensor) -> float:
+    positive = weights.detach().float().cpu()
+    positive = positive[positive > 0]
+    if positive.numel() == 0:
+        return 0.0
+    return float(positive.min().item())
+
+
+def _pairwise_cosine_summary(
+    *,
+    context_ids: tuple[int, ...],
+    cosine: torch.Tensor,
+) -> tuple[int, int, float, float, float, tuple[int, int] | None]:
+    context_count = len(context_ids)
+    if context_count <= 1:
+        return 0, 0, 1.0, 1.0, 1.0, None
+
+    indices = torch.triu_indices(context_count, context_count, offset=1)
+    values = cosine[indices[0], indices[1]].detach().float().cpu()
+
+    pair_count = int(values.numel())
+    negative_pair_count = int((values < 0).sum().item())
+
+    min_index = int(torch.argmin(values).item())
+    left = int(indices[0, min_index].item())
+    right = int(indices[1, min_index].item())
+
+    return (
+        pair_count,
+        negative_pair_count,
+        float(values.mean().item()),
+        float(values.max().item()),
+        float(values.min().item()),
+        (int(context_ids[left]), int(context_ids[right])),
+    )
+
+
 def probe_from_context_losses(
     *,
     context_ids: tuple[int, ...],
@@ -213,48 +275,116 @@ def probe_from_context_losses(
     gram = gradient_gram(gradients)
     cosine = cosine_from_gram(gram)
     weights = solve_mgda_weights(gram)
+
     mgda_squared_norm = float(weights @ gram @ weights)
     pareto_gap = float(max(mgda_squared_norm, 0.0) ** 0.5)
+
     weight_norm_squared = float(weights @ weights)
     dual_thickness = float(1.0 / max(weight_norm_squared, 1e-12))
 
-    context_count = len(context_ids)
-    if context_count > 1:
-        off_diagonal = cosine[~torch.eye(context_count, dtype=torch.bool)]
-        negative_cosine_fraction = float((off_diagonal < 0).float().mean().item())
-        min_pairwise_cosine = float(off_diagonal.min().item())
-    else:
-        negative_cosine_fraction = 0.0
-        min_pairwise_cosine = 1.0
+    (
+        pair_count,
+        negative_pair_count,
+        mean_pairwise_cosine,
+        max_pairwise_cosine,
+        min_pairwise_cosine,
+        most_conflicting_pair,
+    ) = _pairwise_cosine_summary(
+        context_ids=context_ids,
+        cosine=cosine,
+    )
+
+    negative_cosine_fraction = (
+        float(negative_pair_count / pair_count)
+        if pair_count > 0
+        else 0.0
+    )
+
+    losses = context_losses.detach().float().cpu()
+    weights_cpu = weights.detach().float().cpu()
+
+    max_loss_index = int(torch.argmax(losses).item())
+    max_lambda_index = int(torch.argmax(weights_cpu).item())
+
+    lambda_support_tolerance = 1e-6
+    lambda_support = int((weights_cpu > lambda_support_tolerance).sum().item())
 
     return ContextProbe(
         context_ids=context_ids,
-        losses=context_losses.detach().float().cpu(),
+        losses=losses,
         gradient_dot=gram.detach().float().cpu(),
         gradient_norms=torch.sqrt(torch.clamp(torch.diag(gram), min=0.0)).cpu(),
         cosine=cosine.detach().float().cpu(),
-        mgda_lambda=weights.detach().float().cpu(),
+        mgda_lambda=weights_cpu,
         pareto_gap=pareto_gap,
         dual_thickness=dual_thickness,
         negative_cosine_fraction=negative_cosine_fraction,
         min_pairwise_cosine=min_pairwise_cosine,
+        context_count=len(context_ids),
+        lambda_support=lambda_support,
+        lambda_entropy_bits=_lambda_entropy_bits(weights_cpu),
+        lambda_max=float(weights_cpu.max().item()),
+        lambda_min_positive=_lambda_min_positive(weights_cpu),
+        lambda_weighted_loss=float((weights_cpu * losses).sum().item()),
+        loss_min=float(losses.min().item()),
+        loss_range=float((losses.max() - losses.min()).item()),
+        max_loss_context_id=int(context_ids[max_loss_index]),
+        max_lambda_context_id=int(context_ids[max_lambda_index]),
+        pair_count=pair_count,
+        negative_pair_count=negative_pair_count,
+        mean_pairwise_cosine=mean_pairwise_cosine,
+        max_pairwise_cosine=max_pairwise_cosine,
+        most_conflicting_pair=most_conflicting_pair,
     )
 
 
-def probe_to_log_dict(probe: ContextProbe, *, step: int) -> dict[str, object]:
-    return {
+def probe_to_log_dict(
+    probe: ContextProbe,
+    *,
+    step: int,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "step": int(step),
         "context_ids": [int(context_id) for context_id in probe.context_ids],
+        "context_count": int(probe.context_count),
         "context_losses": [float(value) for value in probe.losses.tolist()],
         "loss_mean": float(probe.losses.mean().item()),
         "loss_max": float(probe.losses.max().item()),
+        "loss_min": float(probe.loss_min),
+        "loss_range": float(probe.loss_range),
+        "lambda_weighted_loss": float(probe.lambda_weighted_loss),
+
         "gradient_norms": [float(value) for value in probe.gradient_norms.tolist()],
         "dual_lambda": [float(value) for value in probe.mgda_lambda.tolist()],
         "dual_thickness": float(probe.dual_thickness),
+        "lambda_support": int(probe.lambda_support),
+        "lambda_entropy_bits": float(probe.lambda_entropy_bits),
+        "lambda_max": float(probe.lambda_max),
+        "lambda_min_positive": float(probe.lambda_min_positive),
+
         "pareto_gap": float(probe.pareto_gap),
+
+        "pair_count": int(probe.pair_count),
+        "negative_pair_count": int(probe.negative_pair_count),
         "negative_cosine_fraction": float(probe.negative_cosine_fraction),
         "min_pairwise_cosine": float(probe.min_pairwise_cosine),
+        "mean_pairwise_cosine": float(probe.mean_pairwise_cosine),
+        "max_pairwise_cosine": float(probe.max_pairwise_cosine),
+        "most_conflicting_pair": (
+            [int(probe.most_conflicting_pair[0]), int(probe.most_conflicting_pair[1])]
+            if probe.most_conflicting_pair is not None
+            else None
+        ),
+
+        "max_loss_context_id": int(probe.max_loss_context_id),
+        "max_lambda_context_id": int(probe.max_lambda_context_id),
     }
+
+    if extra:
+        payload.update(extra)
+
+    return payload
 
 
 def weighted_context_loss(

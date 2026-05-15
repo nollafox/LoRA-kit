@@ -42,10 +42,9 @@ CACHE_ENCODING_MAX_BATCH_SIZE: Final = 4
 CACHE_ENCODING_MIN_BATCH_SIZE: Final = 1
 CACHE_DIR_NAME: Final = "tensor-cache"
 CACHE_MANIFEST_NAME: Final = "manifest.json"
-PROBE_LOG_NAME: Final = "context-probes.jsonl"
+PROBE_LOG_NAME = "context-probes.jsonl"
 PROBE_INITIAL_STEPS: Final = 3
 PROBE_EVERY_STEPS: Final = 25
-# PROBE_MIN_FREE_CUDA_BYTES: Final = 1_000_000_000
 PROBE_MIN_FREE_CUDA_BYTES: Final = 500_000_000
 HASH_CHUNK_SIZE_BYTES: Final = 1024 * 1024
 
@@ -157,9 +156,7 @@ def train(spec: BackendSpec) -> BackendResult:
         encoder_hidden_state_paths=encoder_hidden_state_paths,
     )
     _write_cache_manifest(cache_dir / CACHE_MANIFEST_NAME, cache_records)
-    dataset = _DiskCachedLatentDataset(
-        records=cache_records,
-    )
+    dataset = _DiskCachedLatentDataset(records=cache_records)
     dataloader = DataLoader(
         dataset,
         batch_sampler=_LatentShapeBatchSampler(
@@ -196,13 +193,6 @@ def train(spec: BackendSpec) -> BackendResult:
         disable=not accelerator.is_local_main_process,
     )
     probe_log_path = spec.output_dir / PROBE_LOG_NAME
-    _write_probe_status_if_main(
-        probe_log_path=probe_log_path,
-        step=0,
-        should_log=accelerator.is_local_main_process,
-        status="started",
-        free_cuda_bytes=_cuda_free_bytes(),
-    )
     while global_step < spec.steps:
         for batch in dataloader:
             with accelerator.accumulate(unet):
@@ -219,6 +209,24 @@ def train(spec: BackendSpec) -> BackendResult:
                     sync_gradients=accelerator.sync_gradients,
                 )
                 if should_probe:
+                    cuda_memory_before_probe = _cuda_memory_snapshot()
+                    _write_probe_status_if_main(
+                        probe_log_path=probe_log_path,
+                        step=global_step,
+                        should_log=accelerator.is_local_main_process,
+                        status="started",
+                        free_cuda_bytes=(
+                            cuda_memory_before_probe["free_cuda_bytes"]
+                            if cuda_memory_before_probe is not None
+                            else None
+                        ),
+                        extra={
+                            "probe_version": 2,
+                            "microbatch_size": int(loss_context.noise.shape[0]),
+                            "requested_batch_size": int(spec.batch_size),
+                            "gradient_accumulation": int(spec.gradient_accumulation),
+                        },
+                    )
                     try:
                         _write_streaming_context_probe_if_main(
                             unet=unet,
@@ -230,6 +238,10 @@ def train(spec: BackendSpec) -> BackendResult:
                             probe_log_path=probe_log_path,
                             step=global_step,
                             should_log=accelerator.is_local_main_process,
+                            requested_batch_size=spec.batch_size,
+                            gradient_accumulation=spec.gradient_accumulation,
+                            training_loss=loss,
+                            cuda_memory_before_probe=cuda_memory_before_probe,
                         )
                     except Exception as exc:
                         if not _is_cuda_oom(exc):
@@ -241,6 +253,11 @@ def train(spec: BackendSpec) -> BackendResult:
                             should_log=accelerator.is_local_main_process,
                             status="skipped_cuda_oom",
                             free_cuda_bytes=_cuda_free_bytes(),
+                            extra={
+                                "probe_version": 2,
+                                "requested_batch_size": int(spec.batch_size),
+                                "gradient_accumulation": int(spec.gradient_accumulation),
+                            },
                         )
                 elif accelerator.sync_gradients and accelerator.is_local_main_process:
                     free_cuda_bytes = _cuda_free_bytes()
@@ -251,6 +268,11 @@ def train(spec: BackendSpec) -> BackendResult:
                             should_log=True,
                             status="skipped_low_cuda_memory",
                             free_cuda_bytes=free_cuda_bytes,
+                            extra={
+                                "probe_version": 2,
+                                "requested_batch_size": int(spec.batch_size),
+                                "gradient_accumulation": int(spec.gradient_accumulation),
+                            },
                         )
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
@@ -330,7 +352,7 @@ class _DiskCachedLatentDataset(Dataset):
     def __len__(self) -> int:
         return len(self._records)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, index: int) -> dict[str, object]:
         record = self._records[index]
         return {
             "latents": _load_tensor(record.latent_path, expected_shape=record.latent_shape),
@@ -338,6 +360,10 @@ class _DiskCachedLatentDataset(Dataset):
                 record.encoder_hidden_state_path,
                 expected_shape=record.encoder_hidden_state_shape,
             ),
+            "record_index": index,
+            "image": record.image,
+            "latent_shape": record.latent_shape,
+            "encoder_hidden_state_shape": record.encoder_hidden_state_shape,
         }
 
 
@@ -791,14 +817,24 @@ def _text_sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _collate_cached(examples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+def _collate_cached(examples: list[dict[str, object]]) -> dict[str, object]:
+    latents = [example["latents"] for example in examples]
+    encoder_hidden_states = [example["encoder_hidden_states"] for example in examples]
+
+    if not all(isinstance(value, torch.Tensor) for value in latents):
+        raise LorakitError("Cached latent batch contains non-tensor values")
+    if not all(isinstance(value, torch.Tensor) for value in encoder_hidden_states):
+        raise LorakitError("Cached text embedding batch contains non-tensor values")
+
     return {
-        "latents": torch.stack([example["latents"] for example in examples]).to(
+        "latents": torch.stack(latents).to(memory_format=torch.contiguous_format),
+        "encoder_hidden_states": torch.stack(encoder_hidden_states).to(
             memory_format=torch.contiguous_format
         ),
-        "encoder_hidden_states": torch.stack(
-            [example["encoder_hidden_states"] for example in examples]
-        ).to(memory_format=torch.contiguous_format),
+        "record_indices": [int(example["record_index"]) for example in examples],
+        "images": [str(example["image"]) for example in examples],
+        "latent_shape": list(latents[0].shape),
+        "encoder_hidden_state_shape": list(encoder_hidden_states[0].shape),
     }
 
 
@@ -813,15 +849,22 @@ def _optimizer(parameters: list[torch.nn.Parameter], learning_rate: float):
     )
 
 
+def _batch_tensor(batch: dict[str, object], key: str) -> torch.Tensor:
+    value = batch[key]
+    if not isinstance(value, torch.Tensor):
+        raise LorakitError(f"Batch {key} must be a tensor")
+    return value
+
+
 def _loss_context(
     *,
-    batch: dict[str, torch.Tensor],
+    batch: dict[str, object],
     unet: UNet2DConditionModel,
     noise_scheduler: DDPMScheduler,
     weight_dtype: torch.dtype,
 ) -> _LossContext:
-    latents = batch["latents"].to(device=unet.device, dtype=weight_dtype)
-    encoder_hidden_states = batch["encoder_hidden_states"].to(
+    latents = _batch_tensor(batch, "latents").to(device=unet.device, dtype=weight_dtype)
+    encoder_hidden_states = _batch_tensor(batch, "encoder_hidden_states").to(
         device=unet.device,
         dtype=weight_dtype,
     )
@@ -877,6 +920,96 @@ def _cuda_free_bytes() -> int | None:
     return int(free)
 
 
+def _cuda_memory_snapshot() -> dict[str, int] | None:
+    if not torch.cuda.is_available():
+        return None
+    free, total = torch.cuda.mem_get_info()
+    return {
+        "free_cuda_bytes": int(free),
+        "total_cuda_bytes": int(total),
+        "allocated_cuda_bytes": int(torch.cuda.memory_allocated()),
+        "reserved_cuda_bytes": int(torch.cuda.memory_reserved()),
+        "max_allocated_cuda_bytes": int(torch.cuda.max_memory_allocated()),
+        "max_reserved_cuda_bytes": int(torch.cuda.max_memory_reserved()),
+    }
+
+
+def _snr_for_timesteps(
+    *,
+    noise_scheduler: DDPMScheduler,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(
+        device=timesteps.device,
+        dtype=torch.float32,
+    )
+    alpha = torch.sqrt(alphas_cumprod[timesteps])
+    sigma = torch.sqrt(1.0 - alphas_cumprod[timesteps]).clamp_min(1e-12)
+    return (alpha / sigma) ** 2
+
+
+def _jsonable_int_list(value: object) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.detach().cpu().reshape(-1).tolist()]
+    if isinstance(value, list):
+        return [int(item) for item in value]
+    return []
+
+
+def _jsonable_str_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return []
+
+
+def _probe_extra_metadata(
+    *,
+    batch: dict[str, object],
+    noise_scheduler: DDPMScheduler,
+    timesteps: torch.Tensor,
+    requested_batch_size: int,
+    gradient_accumulation: int,
+    training_loss: torch.Tensor,
+    cuda_memory_before_probe: dict[str, int] | None,
+) -> dict[str, object]:
+    latents = _batch_tensor(batch, "latents")
+    encoder_hidden_states = _batch_tensor(batch, "encoder_hidden_states")
+
+    detached_timesteps = timesteps.detach().cpu()
+    snr = _snr_for_timesteps(
+        noise_scheduler=noise_scheduler,
+        timesteps=timesteps.to(device=latents.device).long(),
+    ).detach().float().cpu()
+
+    return {
+        "probe_version": 2,
+        "microbatch_size": int(latents.shape[0]),
+        "requested_batch_size": int(requested_batch_size),
+        "gradient_accumulation": int(gradient_accumulation),
+
+        "latent_batch_shape": [int(item) for item in latents.shape],
+        "latent_item_shape": [int(item) for item in latents.shape[1:]],
+        "encoder_hidden_state_batch_shape": [int(item) for item in encoder_hidden_states.shape],
+        "encoder_hidden_state_item_shape": [int(item) for item in encoder_hidden_states.shape[1:]],
+
+        "record_indices": _jsonable_int_list(batch.get("record_indices")),
+        "images": _jsonable_str_list(batch.get("images")),
+
+        "timesteps": [int(item) for item in detached_timesteps.tolist()],
+        "snr": [float(item) for item in snr.tolist()],
+        "snr_min": float(snr.min().item()),
+        "snr_max": float(snr.max().item()),
+        "snr_mean": float(snr.mean().item()),
+
+        "prediction_type": str(noise_scheduler.config.prediction_type),
+        "num_train_timesteps": int(noise_scheduler.config.num_train_timesteps),
+        "training_loss": float(training_loss.detach().float().cpu().item()),
+
+        "cuda_memory_before_probe": cuda_memory_before_probe,
+        "cuda_memory_after_probe": _cuda_memory_snapshot(),
+    }
+
+
 def _write_probe_status_if_main(
     *,
     probe_log_path: Path,
@@ -884,14 +1017,20 @@ def _write_probe_status_if_main(
     should_log: bool,
     status: str,
     free_cuda_bytes: int | None,
+    extra: dict[str, object] | None = None,
 ) -> None:
     if not should_log:
         return
-    payload = {
+
+    payload: dict[str, object] = {
         "step": int(step),
         "probe_status": status,
         "free_cuda_bytes": free_cuda_bytes,
     }
+
+    if extra:
+        payload.update(extra)
+
     probe_log_path.parent.mkdir(parents=True, exist_ok=True)
     with probe_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True))
@@ -901,7 +1040,7 @@ def _write_probe_status_if_main(
 def _write_streaming_context_probe_if_main(
     *,
     unet: UNet2DConditionModel,
-    batch: dict[str, torch.Tensor],
+    batch: dict[str, object],
     noise_scheduler: DDPMScheduler,
     weight_dtype: torch.dtype,
     noise: torch.Tensor,
@@ -909,12 +1048,18 @@ def _write_streaming_context_probe_if_main(
     probe_log_path: Path,
     step: int,
     should_log: bool,
+    requested_batch_size: int,
+    gradient_accumulation: int,
+    training_loss: torch.Tensor,
+    cuda_memory_before_probe: dict[str, int] | None,
 ) -> None:
     parameters = certified_trainable_parameters(unet)
     device_timesteps = timesteps.to(device=unet.device).long()
     context_ids = tuple(sorted({int(value) for value in device_timesteps.detach().cpu().tolist()}))
     context_losses: list[torch.Tensor] = []
     gradients: list[torch.Tensor] = []
+    emitted_context_ids: list[int] = []
+
     for context_id in context_ids:
         mask = device_timesteps == context_id
         if not torch.any(mask):
@@ -937,17 +1082,28 @@ def _write_streaming_context_probe_if_main(
         )
         context_losses.append(context_loss.detach().float().cpu())
         gradients.append(_flatten_grads_from_autograd(parameters=parameters, grads=grads))
+        emitted_context_ids.append(context_id)
         del context_loss
         del grads
 
     if not should_log or not context_losses:
         return
+
     probe = probe_from_context_losses(
-        context_ids=context_ids,
+        context_ids=tuple(emitted_context_ids),
         context_losses=torch.stack(context_losses),
         gradients=gradients,
     )
-    payload = probe_to_log_dict(probe, step=step)
+    extra = _probe_extra_metadata(
+        batch=batch,
+        noise_scheduler=noise_scheduler,
+        timesteps=timesteps,
+        requested_batch_size=requested_batch_size,
+        gradient_accumulation=gradient_accumulation,
+        training_loss=training_loss,
+        cuda_memory_before_probe=cuda_memory_before_probe,
+    )
+    payload = probe_to_log_dict(probe, step=step, extra=extra)
     probe_log_path.parent.mkdir(parents=True, exist_ok=True)
     with probe_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True))
@@ -956,7 +1112,7 @@ def _write_streaming_context_probe_if_main(
 
 def _fixed_subset_context_loss(
     *,
-    batch: dict[str, torch.Tensor],
+    batch: dict[str, object],
     mask: torch.Tensor,
     unet: UNet2DConditionModel,
     noise_scheduler: DDPMScheduler,
@@ -964,8 +1120,8 @@ def _fixed_subset_context_loss(
     noise: torch.Tensor,
     timesteps: torch.Tensor,
 ) -> torch.Tensor:
-    latents = batch["latents"].to(device=unet.device, dtype=weight_dtype)[mask]
-    encoder_hidden_states = batch["encoder_hidden_states"].to(
+    latents = _batch_tensor(batch, "latents").to(device=unet.device, dtype=weight_dtype)[mask]
+    encoder_hidden_states = _batch_tensor(batch, "encoder_hidden_states").to(
         device=unet.device,
         dtype=weight_dtype,
     )[mask]
