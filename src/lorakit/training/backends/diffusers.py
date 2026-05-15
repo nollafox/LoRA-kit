@@ -20,7 +20,6 @@ import copy
 import gc
 import json
 import shutil
-import random
 from importlib.util import find_spec
 from dataclasses import dataclass
 from pathlib import Path
@@ -1616,6 +1615,7 @@ def _candidate_step_certificates_for_probe_window(
     certificate_objects: dict[str, StepCertificate] = {}
     results: dict[str, object] = {}
     update_norms: dict[str, float] = {}
+    backtrack_factors_by_name: dict[str, float] = {}
     guardrail = _default_guardrail_decision()
 
     try:
@@ -1650,9 +1650,15 @@ def _candidate_step_certificates_for_probe_window(
                     _restore_trainable_parameters(parameters, parameter_snapshot)
                     _restore_trainable_gradients(parameters, gradient_snapshot)
                     _restore_optimizer_state(optimizer, optimizer_snapshot)
+                    candidate_name = f"adamw_backtrack_{factor:g}"
                     before_bt = _snapshot_trainable_parameters(parameters)
                     optimizer.step()
                     _scale_trainable_update(parameters=parameters, before=before_bt, factor=factor)
+                    update_norms[candidate_name] = _trainable_update_norm_from_snapshot(
+                        parameters=parameters,
+                        snapshot=before_bt,
+                    )
+                    backtrack_factors_by_name[candidate_name] = float(factor)
                     with torch.no_grad():
                         bt_losses = _evaluate_probe_context_losses(
                             probe_batches=probe_batches,
@@ -1668,9 +1674,9 @@ def _candidate_step_certificates_for_probe_window(
                         step_size=step_size * factor,
                         context_ids=context_ids,
                     )
-                    results[f"adamw_backtrack_{factor:g}"] = certificate_to_log_dict(bt_cert)
+                    results[candidate_name] = certificate_to_log_dict(bt_cert)
                     if bt_cert.accepted_bottleneck:
-                        certificate_objects[f"adamw_backtrack_{factor:g}"] = bt_cert
+                        certificate_objects[candidate_name] = bt_cert
                         break
         else:
             results["adamw_actual"] = {"available": False, "reason": "optimizer_state_snapshot_unavailable"}
@@ -1700,11 +1706,33 @@ def _candidate_step_certificates_for_probe_window(
 
         selection = select_preferred_candidate(certificate_objects, update_norms=update_norms)
         selected = selection.get("selected")
-        if selected == "adamw_actual" or (isinstance(selected, str) and selected.startswith("adamw_backtrack_")):
+        if selected == "adamw_actual":
             guardrail = _GuardrailDecision(
                 handled_update=False,
                 committed_update=str(selected),
                 backtracks=int(certificate_objects[str(selected)].backtracks),
+                fallback_used=False,
+                skipped_update=False,
+            )
+        elif isinstance(selected, str) and selected in backtrack_factors_by_name:
+            if optimizer_snapshot is None:
+                raise LorakitError(
+                    f"Cannot commit backtracked optimizer candidate without optimizer state: {selected}"
+                )
+            _restore_trainable_parameters(parameters, parameter_snapshot)
+            _restore_trainable_gradients(parameters, gradient_snapshot)
+            _restore_optimizer_state(optimizer, optimizer_snapshot)
+            backtrack_start = _snapshot_trainable_parameters(parameters)
+            optimizer.step()
+            _scale_trainable_update(
+                parameters=parameters,
+                before=backtrack_start,
+                factor=backtrack_factors_by_name[selected],
+            )
+            guardrail = _GuardrailDecision(
+                handled_update=True,
+                committed_update=selected,
+                backtracks=int(certificate_objects[selected].backtracks),
                 fallback_used=False,
                 skipped_update=False,
             )
@@ -1859,6 +1887,20 @@ def _restore_optimizer_state(optimizer, snapshot) -> None:
 
 def _snapshot_trainable_parameters(parameters: list[torch.nn.Parameter]) -> list[torch.Tensor]:
     return [parameter.detach().clone() for parameter in parameters]
+
+
+def _trainable_update_norm_from_snapshot(
+    *,
+    parameters: list[torch.nn.Parameter],
+    snapshot: list[torch.Tensor],
+) -> float:
+    pieces = [
+        (parameter.detach().float().cpu() - previous.detach().float().cpu()).reshape(-1)
+        for parameter, previous in zip(parameters, snapshot, strict=True)
+    ]
+    if not pieces:
+        raise LorakitError("No trainable parameters found for update norm calculation")
+    return float(torch.linalg.vector_norm(torch.cat(pieces, dim=0)).item())
 
 
 @torch.no_grad()
