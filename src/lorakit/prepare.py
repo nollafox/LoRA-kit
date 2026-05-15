@@ -22,6 +22,7 @@ FORMAT_EXTENSIONS = {
     "jpg": ".jpg",
     "webp": ".webp",
 }
+DIMENSION_MULTIPLE = 8
 
 
 def prepare(paths: Paths, dataset: str, config: PrepareConfig) -> Path:
@@ -105,6 +106,7 @@ def _prepare_image(
         return
     if config.mode == "copy":
         shutil.copy2(source, target)
+        _validate_prepared_dimensions(target)
         return
 
     with Image.open(source) as image:
@@ -125,6 +127,7 @@ def _prepare_watermark_cleaned_image(
 ) -> None:
     if config.mode == "copy":
         watermark_remover.process_file(source, target)
+        _validate_prepared_dimensions(target)
         return
     with tempfile.TemporaryDirectory(prefix="lorakit-watermark-") as temporary_directory:
         cleaned = Path(temporary_directory) / source.name
@@ -154,15 +157,19 @@ def _fit(image: Image.Image, config: PrepareConfig) -> Image.Image:
     if width is None and height is None:
         raise InvalidPrepareConfig("fit mode requires width or height")
     if width is None:
+        height = _coerce_dimension(height)
         scale = height / image.height
-        width = max(1, round(image.width * scale))
+        width = _coerce_dimension(max(1, round(image.width * scale)))
     if height is None:
+        width = _coerce_dimension(width)
         scale = width / image.width
-        height = max(1, round(image.height * scale))
+        height = _coerce_dimension(max(1, round(image.height * scale)))
+    width = _coerce_dimension(width)
+    height = _coerce_dimension(height)
     scale = min(width / image.width, height / image.height)
     target_size = (
-        max(1, round(image.width * scale)),
-        max(1, round(image.height * scale)),
+        _coerce_fit_dimension(max(1, round(image.width * scale)), maximum=width),
+        _coerce_fit_dimension(max(1, round(image.height * scale)), maximum=height),
     )
     return image.resize(target_size, Image.Resampling.LANCZOS)
 
@@ -171,10 +178,46 @@ def _box_dimensions(config: PrepareConfig) -> tuple[int, int]:
     if config.width is None and config.height is None:
         raise InvalidPrepareConfig(f"{config.mode} mode requires width or height")
     if config.width is None:
-        return config.height, config.height
+        dimension = _coerce_dimension(config.height)
+        return dimension, dimension
     if config.height is None:
-        return config.width, config.width
-    return config.width, config.height
+        dimension = _coerce_dimension(config.width)
+        return dimension, dimension
+    return _coerce_dimension(config.width), _coerce_dimension(config.height)
+
+
+def _coerce_dimension(value: int | None) -> int:
+    if value is None:
+        raise InvalidPrepareConfig("dimension cannot be None")
+    lower = (value // DIMENSION_MULTIPLE) * DIMENSION_MULTIPLE
+    upper = ((value + DIMENSION_MULTIPLE - 1) // DIMENSION_MULTIPLE) * DIMENSION_MULTIPLE
+    if lower < DIMENSION_MULTIPLE:
+        lower = DIMENSION_MULTIPLE
+    if upper < DIMENSION_MULTIPLE:
+        upper = DIMENSION_MULTIPLE
+    lower_distance = abs(value - lower)
+    upper_distance = abs(upper - value)
+    if upper_distance <= lower_distance:
+        return upper
+    return lower
+
+
+def _coerce_fit_dimension(value: int, *, maximum: int) -> int:
+    coerced = _coerce_dimension(value)
+    if coerced <= maximum:
+        return coerced
+    lowered = (maximum // DIMENSION_MULTIPLE) * DIMENSION_MULTIPLE
+    return max(DIMENSION_MULTIPLE, lowered)
+
+
+def _validate_prepared_dimensions(path: Path) -> None:
+    with Image.open(path) as image:
+        width, height = ImageOps.exif_transpose(image).size
+    if width % DIMENSION_MULTIPLE != 0 or height % DIMENSION_MULTIPLE != 0:
+        raise InvalidPrepareConfig(
+            "copy mode requires source image dimensions divisible by "
+            f"{DIMENSION_MULTIPLE}: {path} is {width}x{height}"
+        )
 
 
 def _new_background(image: Image.Image, width: int, height: int) -> Image.Image:

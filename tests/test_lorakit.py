@@ -687,7 +687,7 @@ def test_clean_reports_and_deletes_candidate_and_staged_orphans(tmp_path):
 
 def test_prepare_writes_manifest_and_supports_fit_center_crop_pad_and_copy(tmp_path):
     paths = Paths(tmp_path / "data")
-    _candidate(paths, "wide", size=(100, 50), tags=["wide"])
+    _candidate(paths, "wide", size=(104, 48), tags=["wide"])
     project = Project(paths.root)
     project.datasets.create("ds")
     project.datasets.stage("ds", "wide")
@@ -696,7 +696,7 @@ def test_prepare_writes_manifest_and_supports_fit_center_crop_pad_and_copy(tmp_p
         "ds",
         PrepareConfig(width=50, height=50, trigger="lorakit"),
     )
-    assert _image_size(prepared / "images" / "wide.png") == (50, 25)
+    assert _image_size(prepared / "images" / "wide.png") == (48, 24)
     assert read_manifest(prepared / MANIFEST_NAME) == [
         {
             "caption": "lorakit, wide. lorakit, wide",
@@ -715,7 +715,7 @@ def test_prepare_writes_manifest_and_supports_fit_center_crop_pad_and_copy(tmp_p
     assert _image_size(prepared / "images" / "wide.png") == (40, 40)
 
     prepared = project.datasets.prepare("ds", PrepareConfig(mode="copy", width=None, height=None))
-    assert _image_size(prepared / "images" / "wide.png") == (100, 50)
+    assert _image_size(prepared / "images" / "wide.png") == (104, 48)
 
 
 def test_prepare_uses_watermark_remover_by_default_and_can_disable_it(tmp_path, monkeypatch):
@@ -938,6 +938,40 @@ def test_prepare_dimension_rules_for_single_dimension_modes(tmp_path):
         PrepareConfig(mode="pad", width=None, height=40),
     )
     assert _image_size(prepared / "images" / "tall.png") == (40, 40)
+
+
+def test_prepare_coerces_all_resized_dimensions_to_multiples_of_eight(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "wide", size=(100, 50))
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "wide")
+
+    prepared = project.datasets.prepare("ds", PrepareConfig(width=51, height=51))
+    assert _image_size(prepared / "images" / "wide.png") == (48, 24)
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(mode="center-crop", width=51, height=47),
+    )
+    assert _image_size(prepared / "images" / "wide.png") == (48, 48)
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(mode="pad", width=None, height=42),
+    )
+    assert _image_size(prepared / "images" / "wide.png") == (40, 40)
+
+
+def test_prepare_copy_rejects_non_multiple_of_eight_sources(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "odd", size=(100, 50))
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "odd")
+
+    with pytest.raises(InvalidPrepareConfig, match="divisible by 8"):
+        project.datasets.prepare("ds", PrepareConfig(mode="copy", width=None, height=None))
 
 
 def test_models_list_resolve_remove_search_and_fetch(tmp_path, monkeypatch):
