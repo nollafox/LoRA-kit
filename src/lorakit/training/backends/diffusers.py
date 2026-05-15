@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Final
 
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
@@ -25,6 +24,14 @@ from diffusers.utils import convert_state_dict_to_diffusers
 from lorakit.errors import LorakitError
 from lorakit.manifest import MANIFEST_NAME, read_manifest
 from lorakit.training.backends.types import BackendResult, BackendSpec
+from lorakit.training.certified_stepper import (
+    context_gradients,
+    context_losses_from_examples,
+    denoising_loss_per_example,
+    probe_from_context_losses,
+    probe_to_log_dict,
+    trainable_parameters as certified_trainable_parameters,
+)
 
 
 LORA_TARGET_MODULES = ["to_k", "to_q", "to_v", "to_out.0"]
@@ -35,6 +42,7 @@ VAE_DOWNSAMPLE_FACTOR: Final = 8
 CACHE_ENCODING_BATCH_SIZE: Final = 4
 CACHE_DIR_NAME: Final = "tensor-cache"
 CACHE_MANIFEST_NAME: Final = "manifest.json"
+PROBE_LOG_NAME: Final = "context-probes.jsonl"
 HASH_CHUNK_SIZE_BYTES: Final = 1024 * 1024
 
 
@@ -181,14 +189,24 @@ def train(spec: BackendSpec) -> BackendResult:
         desc="Steps",
         disable=not accelerator.is_local_main_process,
     )
+    probe_log_path = spec.output_dir / PROBE_LOG_NAME
     while global_step < spec.steps:
         for batch in dataloader:
             with accelerator.accumulate(unet):
-                loss = _loss(
+                loss_context = _loss_context(
                     batch=batch,
                     unet=unet,
                     noise_scheduler=noise_scheduler,
                     weight_dtype=weight_dtype,
+                )
+                loss = loss_context.loss
+                _write_context_probe_if_main(
+                    unet=unet,
+                    loss_context=loss_context,
+                    probe_log_path=probe_log_path,
+                    step=global_step,
+                    should_probe=accelerator.sync_gradients,
+                    should_log=accelerator.is_local_main_process,
                 )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -245,6 +263,13 @@ class _CacheRecord:
     encoder_hidden_state_path: Path
     latent_shape: tuple[int, ...]
     encoder_hidden_state_shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _LossContext:
+    loss: torch.Tensor
+    context_ids: tuple[int, ...]
+    context_losses: torch.Tensor
 
 
 class _DiskCachedLatentDataset(Dataset):
@@ -641,13 +666,13 @@ def _optimizer(parameters: list[torch.nn.Parameter], learning_rate: float):
     )
 
 
-def _loss(
+def _loss_context(
     *,
     batch: dict[str, torch.Tensor],
     unet: UNet2DConditionModel,
     noise_scheduler: DDPMScheduler,
     weight_dtype: torch.dtype,
-) -> torch.Tensor:
+) -> _LossContext:
     latents = batch["latents"].to(device=unet.device, dtype=weight_dtype)
     encoder_hidden_states = batch["encoder_hidden_states"].to(
         device=unet.device,
@@ -674,7 +699,50 @@ def _loss(
         encoder_hidden_states,
         return_dict=False,
     )[0]
-    return F.mse_loss(prediction.float(), target.float(), reduction="mean")
+    per_example_loss = denoising_loss_per_example(
+        model_pred=prediction,
+        target=target,
+    )
+    context_ids, context_losses = context_losses_from_examples(
+        per_example_loss=per_example_loss,
+        timesteps=timesteps,
+    )
+    return _LossContext(
+        loss=per_example_loss.mean(),
+        context_ids=context_ids,
+        context_losses=context_losses,
+    )
+
+
+def _write_context_probe_if_main(
+    *,
+    unet: UNet2DConditionModel,
+    loss_context: _LossContext,
+    probe_log_path: Path,
+    step: int,
+    should_probe: bool,
+    should_log: bool,
+) -> None:
+    if not should_probe:
+        return
+    parameters = certified_trainable_parameters(unet)
+    gradients = context_gradients(
+        context_losses=loss_context.context_losses,
+        parameters=parameters,
+        retain_graph=True,
+    )
+    if not should_log:
+        return
+    probe = probe_from_context_losses(
+        context_ids=loss_context.context_ids,
+        context_losses=loss_context.context_losses,
+        gradients=gradients,
+    )
+    payload = probe_to_log_dict(probe, step=step)
+    probe_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with probe_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True))
+        handle.write("\n")
 
 
 def _target(

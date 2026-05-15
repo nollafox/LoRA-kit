@@ -1078,6 +1078,105 @@ def test_diffusers_disk_cache_dataset_validates_and_loads_tensors(tmp_path):
     assert tuple(item["encoder_hidden_states"].shape) == (77, 768)
 
 
+def test_certified_stepper_projects_to_simplex():
+    from lorakit.training import certified_stepper
+
+    projected = certified_stepper.project_to_simplex(torch.tensor([-1.0, 0.25, 2.0]))
+
+    assert torch.all(projected >= 0)
+    assert float(projected.sum().item()) == pytest.approx(1.0)
+
+
+def test_certified_stepper_mgda_single_gradient():
+    from lorakit.training import certified_stepper
+
+    weights = certified_stepper.solve_mgda_weights(torch.tensor([[4.0]]))
+
+    assert weights.tolist() == [1.0]
+
+
+def test_certified_stepper_mgda_identical_gradients_returns_simplex():
+    from lorakit.training import certified_stepper
+
+    gram = torch.tensor([[2.0, 2.0], [2.0, 2.0]])
+    weights = certified_stepper.solve_mgda_weights(gram)
+
+    assert torch.all(weights >= 0)
+    assert float(weights.sum().item()) == pytest.approx(1.0)
+
+
+def test_certified_stepper_mgda_opposite_gradients_has_near_zero_gap():
+    from lorakit.training import certified_stepper
+
+    gradients = [torch.tensor([1.0, 0.0]), torch.tensor([-1.0, 0.0])]
+    probe = certified_stepper.probe_from_context_losses(
+        context_ids=(1, 2),
+        context_losses=torch.tensor([0.5, 0.6]),
+        gradients=gradients,
+    )
+
+    assert probe.mgda_lambda.tolist() == pytest.approx([0.5, 0.5], abs=1e-4)
+    assert probe.pareto_gap == pytest.approx(0.0, abs=1e-4)
+    assert probe.negative_cosine_fraction == pytest.approx(1.0)
+
+
+def test_certified_stepper_groups_context_losses_by_exact_timestep():
+    from lorakit.training import certified_stepper
+
+    context_ids, losses = certified_stepper.context_losses_from_examples(
+        per_example_loss=torch.tensor([1.0, 3.0, 10.0]),
+        timesteps=torch.tensor([7, 7, 2]),
+    )
+
+    assert context_ids == (2, 7)
+    assert losses.tolist() == pytest.approx([10.0, 2.0])
+
+
+def test_certified_stepper_context_gradients_use_trainable_parameters_only():
+    from lorakit.training import certified_stepper
+
+    trainable = torch.nn.Parameter(torch.tensor([2.0]))
+    frozen = torch.nn.Parameter(torch.tensor([3.0]), requires_grad=False)
+    losses = torch.stack([trainable.pow(2).sum(), (trainable * 3.0 + frozen).sum()])
+
+    gradients = certified_stepper.context_gradients(
+        context_losses=losses,
+        parameters=[trainable],
+    )
+
+    assert [float(gradient.item()) for gradient in gradients] == pytest.approx([4.0, 3.0])
+    assert trainable.grad is None
+
+
+def test_certified_stepper_certify_losses_accepts_non_worsening_update():
+    from lorakit.training import certified_stepper
+
+    certificate = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([2.0, 3.0]),
+        new_context_losses=torch.tensor([1.5, 3.0]),
+        backtracks=1,
+        step_size=0.25,
+    )
+
+    assert certificate.accepted
+    assert certificate.mean_delta < 0
+    assert certificate.max_delta == pytest.approx(0.0)
+
+
+def test_certified_stepper_certify_losses_rejects_context_increase():
+    from lorakit.training import certified_stepper
+
+    certificate = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([2.0, 3.0]),
+        new_context_losses=torch.tensor([1.0, 3.1]),
+        backtracks=0,
+        step_size=1.0,
+    )
+
+    assert not certificate.accepted
+    assert certificate.reason == "rejected_context_or_mean_increase"
+
+
 def test_models_remove_rejects_non_local_repo_id(tmp_path):
     project = Project(tmp_path / "data")
 
