@@ -27,6 +27,7 @@ from lorakit.errors import LorakitError
 from lorakit.manifest import MANIFEST_NAME, read_manifest
 from lorakit.training.backends.types import BackendResult, BackendSpec
 from lorakit.training.certified_stepper import (
+    StepCertificate,
     candidate_first_order_summaries,
     certificate_to_log_dict,
     certify_losses,
@@ -49,11 +50,13 @@ CACHE_ENCODING_MIN_BATCH_SIZE: Final = 1
 CACHE_DIR_NAME: Final = "tensor-cache"
 CACHE_MANIFEST_NAME: Final = "manifest.json"
 PROBE_LOG_NAME = "context-probes.jsonl"
+PROBE_SUMMARY_NAME = "context-probes-summary.json"
 PROBE_INITIAL_STEPS: Final = 3
 PROBE_EVERY_STEPS: Final = 25
 PROBE_MIN_FREE_CUDA_BYTES: Final = 500_000_000
 PROBE_WINDOW_TARGET_ITEMS: Final = 4
 PROBE_VERSION: Final = 4
+CERTIFIED_BACKTRACK_FACTORS: Final = (1.0, 0.5, 0.25, 0.125)
 HASH_CHUNK_SIZE_BYTES: Final = 1024 * 1024
 
 
@@ -201,8 +204,10 @@ def train(spec: BackendSpec) -> BackendResult:
         disable=not accelerator.is_local_main_process,
     )
     probe_log_path = spec.output_dir / PROBE_LOG_NAME
+    probe_summary_path = spec.output_dir / PROBE_SUMMARY_NAME
     while global_step < spec.steps:
         for batch in dataloader:
+            guardrail_decision = _default_guardrail_decision()
             with accelerator.accumulate(unet):
                 loss_context = _loss_context(
                     batch=batch,
@@ -241,7 +246,7 @@ def train(spec: BackendSpec) -> BackendResult:
                         },
                     )
                     try:
-                        _write_streaming_context_probe_if_main(
+                        guardrail_decision = _write_streaming_context_probe_if_main(
                             unet=unet,
                             optimizer=optimizer,
                             dataset=dataset,
@@ -290,8 +295,10 @@ def train(spec: BackendSpec) -> BackendResult:
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
                         )
-                optimizer.step()
-                scheduler.step()
+                if not guardrail_decision.handled_update:
+                    optimizer.step()
+                if not guardrail_decision.skipped_update:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             if accelerator.sync_gradients:
@@ -317,7 +324,13 @@ def train(spec: BackendSpec) -> BackendResult:
     model_path = spec.output_dir / LORA_WEIGHTS_NAME
     if not model_path.exists():
         raise LorakitError(f"Diffusers backend did not write LoRA weights: {model_path}")
-    artifact_paths = (probe_log_path,) if probe_log_path.exists() else ()
+    if probe_log_path.exists():
+        _write_probe_summary(probe_log_path=probe_log_path, summary_path=probe_summary_path)
+    artifact_paths = tuple(
+        path
+        for path in (probe_log_path, probe_summary_path)
+        if path.exists()
+    )
     return BackendResult(model_path=model_path, artifact_paths=artifact_paths)
 
 
@@ -355,6 +368,25 @@ class _ProbeBatch:
     noise: torch.Tensor
     timesteps: torch.Tensor
     source: str
+
+
+@dataclass(frozen=True)
+class _GuardrailDecision:
+    handled_update: bool
+    committed_update: str
+    backtracks: int
+    fallback_used: bool
+    skipped_update: bool
+
+
+def _default_guardrail_decision() -> _GuardrailDecision:
+    return _GuardrailDecision(
+        handled_update=False,
+        committed_update="adamw_actual",
+        backtracks=0,
+        fallback_used=False,
+        skipped_update=False,
+    )
 
 
 class _DiskCachedLatentDataset(Dataset):
@@ -1096,6 +1128,75 @@ def _write_probe_status_if_main(
         handle.write("\n")
 
 
+def _write_probe_summary(*, probe_log_path: Path, summary_path: Path) -> None:
+    probes: list[dict[str, object]] = []
+    with probe_log_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict) and "candidate_selection" in payload:
+                probes.append(payload)
+
+    probe_count = len(probes)
+    if probe_count == 0:
+        summary = {
+            "probe_count": 0,
+            "adamw_selected": 0,
+            "adamw_rejected": 0,
+            "fallback_used": 0,
+            "updates_skipped": 0,
+            "mean_dual_thickness": 0.0,
+            "max_dual_thickness": 0.0,
+            "conflict_probe_fraction": 0.0,
+        }
+    else:
+        dual_thickness = [float(probe.get("dual_thickness", 0.0)) for probe in probes]
+        conflict_count = sum(
+            1
+            for probe in probes
+            if float(probe.get("negative_cosine_fraction", 0.0)) > 0.0
+        )
+        guardrails = [
+            probe.get("candidate_selection", {}).get("guardrail", {})
+            for probe in probes
+            if isinstance(probe.get("candidate_selection"), dict)
+        ]
+        summary = {
+            "probe_count": probe_count,
+            "adamw_selected": sum(
+                1
+                for guardrail in guardrails
+                if guardrail.get("committed_update") == "adamw_actual"
+            ),
+            "adamw_rejected": sum(
+                1
+                for probe in probes
+                if not probe.get("candidate_certificates", {})
+                .get("adamw_actual", {})
+                .get("accepted_bottleneck", False)
+            ),
+            "fallback_used": sum(
+                1
+                for guardrail in guardrails
+                if bool(guardrail.get("fallback_used", False))
+            ),
+            "updates_skipped": sum(
+                1
+                for guardrail in guardrails
+                if bool(guardrail.get("skipped_update", False))
+            ),
+            "mean_dual_thickness": float(sum(dual_thickness) / probe_count),
+            "max_dual_thickness": float(max(dual_thickness)),
+            "conflict_probe_fraction": float(conflict_count / probe_count),
+        }
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def _write_streaming_context_probe_if_main(
     *,
     unet: UNet2DConditionModel,
@@ -1114,7 +1215,7 @@ def _write_streaming_context_probe_if_main(
     training_loss: torch.Tensor,
     candidate_step_size: float,
     cuda_memory_before_probe: dict[str, int] | None,
-) -> None:
+) -> _GuardrailDecision:
     parameters = certified_trainable_parameters(unet)
     probe_batches = _build_probe_window(
         dataset=dataset,
@@ -1140,8 +1241,8 @@ def _write_streaming_context_probe_if_main(
         parameters=parameters,
     )
 
-    if not should_log or not gradients:
-        return
+    if not gradients:
+        return _default_guardrail_decision()
 
     probe = probe_from_context_losses(
         context_ids=context_ids,
@@ -1162,7 +1263,11 @@ def _write_streaming_context_probe_if_main(
         mgda_weights=probe.mgda_lambda,
         context_counts=context_counts,
     )
-    candidate_certificates, candidate_selection = _candidate_step_certificates_for_probe_window(
+    (
+        candidate_certificates,
+        candidate_selection,
+        guardrail_decision,
+    ) = _candidate_step_certificates_for_probe_window(
         unet=unet,
         optimizer=optimizer,
         parameters=parameters,
@@ -1195,11 +1300,13 @@ def _write_streaming_context_probe_if_main(
         }
     )
 
-    payload = probe_to_log_dict(probe, step=step, extra=extra)
-    probe_log_path.parent.mkdir(parents=True, exist_ok=True)
-    with probe_log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True))
-        handle.write("\n")
+    if should_log:
+        payload = probe_to_log_dict(probe, step=step, extra=extra)
+        probe_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with probe_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True))
+            handle.write("\n")
+    return guardrail_decision
 
 
 def _build_probe_window(
@@ -1383,12 +1490,12 @@ def _candidate_step_certificates_for_probe_window(
     old_context_losses: torch.Tensor,
     candidate_gradients: dict[str, torch.Tensor],
     step_size: float,
-) -> tuple[dict[str, object], dict[str, object]]:
+) -> tuple[dict[str, object], dict[str, object], _GuardrailDecision]:
     parameter_snapshot = _snapshot_trainable_parameters(parameters)
     gradient_snapshot = _snapshot_trainable_gradients(parameters)
     optimizer_snapshot = _snapshot_optimizer_state(optimizer)
 
-    certificate_objects = {}
+    certificate_objects: dict[str, StepCertificate] = {}
     results: dict[str, object] = {}
     update_norms: dict[str, float] = {}
 
@@ -1462,14 +1569,176 @@ def _candidate_step_certificates_for_probe_window(
         certificate_objects,
         update_norms=update_norms,
     )
-    selection["committed_update"] = "adamw_actual"
-    selection["selection_is_instrumentation_only"] = True
+    guardrail_decision = _commit_certified_guardrail_update(
+        unet=unet,
+        optimizer=optimizer,
+        parameters=parameters,
+        parameter_snapshot=parameter_snapshot,
+        gradient_snapshot=gradient_snapshot,
+        optimizer_snapshot=optimizer_snapshot,
+        probe_batches=probe_batches,
+        noise_scheduler=noise_scheduler,
+        weight_dtype=weight_dtype,
+        context_ids=context_ids,
+        old_context_losses=old_context_losses,
+        candidate_gradients=candidate_gradients,
+        candidate_certificates=certificate_objects,
+        step_size=step_size,
+    )
+    selection["committed_update"] = guardrail_decision.committed_update
+    selection["selection_is_instrumentation_only"] = False
     selection["update_norms"] = {
         name: float(value)
         for name, value in update_norms.items()
     }
+    selection["guardrail"] = {
+        "enabled": True,
+        "probe_step": True,
+        "initial_candidate": "adamw_actual",
+        "committed_update": guardrail_decision.committed_update,
+        "backtracks": int(guardrail_decision.backtracks),
+        "fallback_used": bool(guardrail_decision.fallback_used),
+        "skipped_update": bool(guardrail_decision.skipped_update),
+    }
 
-    return results, selection
+    return results, selection, guardrail_decision
+
+
+def _commit_certified_guardrail_update(
+    *,
+    unet: UNet2DConditionModel,
+    optimizer,
+    parameters: list[torch.nn.Parameter],
+    parameter_snapshot: list[torch.Tensor],
+    gradient_snapshot: list[torch.Tensor | None],
+    optimizer_snapshot,
+    probe_batches: list[_ProbeBatch],
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    context_ids: tuple[int, ...],
+    old_context_losses: torch.Tensor,
+    candidate_gradients: dict[str, torch.Tensor],
+    candidate_certificates: dict[str, StepCertificate],
+    step_size: float,
+) -> _GuardrailDecision:
+    adamw_certificate = candidate_certificates.get("adamw_actual")
+    if optimizer_snapshot is not None and adamw_certificate is not None and adamw_certificate.accepted_bottleneck:
+        _restore_trainable_parameters(parameters, parameter_snapshot)
+        _restore_trainable_gradients(parameters, gradient_snapshot)
+        _restore_optimizer_state(optimizer, optimizer_snapshot)
+        optimizer.step()
+        return _GuardrailDecision(
+            handled_update=True,
+            committed_update="adamw_actual",
+            backtracks=0,
+            fallback_used=False,
+            skipped_update=False,
+        )
+
+    if optimizer_snapshot is not None:
+        for backtrack_index, factor in enumerate(CERTIFIED_BACKTRACK_FACTORS[1:], start=1):
+            certificate = _try_backtracked_adamw_update(
+                unet=unet,
+                optimizer=optimizer,
+                parameters=parameters,
+                parameter_snapshot=parameter_snapshot,
+                gradient_snapshot=gradient_snapshot,
+                optimizer_snapshot=optimizer_snapshot,
+                probe_batches=probe_batches,
+                noise_scheduler=noise_scheduler,
+                weight_dtype=weight_dtype,
+                context_ids=context_ids,
+                old_context_losses=old_context_losses,
+                step_size=step_size * float(factor),
+                factor=float(factor),
+                backtracks=backtrack_index,
+            )
+            if certificate.accepted_bottleneck:
+                return _GuardrailDecision(
+                    handled_update=True,
+                    committed_update="adamw_actual_backtracked",
+                    backtracks=backtrack_index,
+                    fallback_used=False,
+                    skipped_update=False,
+                )
+
+    for name in ("mgda_sgd_proxy", "mean_context_sgd_proxy"):
+        certificate = candidate_certificates.get(name)
+        flat_gradient = candidate_gradients.get(name)
+        if certificate is None or flat_gradient is None or not certificate.accepted_bottleneck:
+            continue
+        _restore_trainable_parameters(parameters, parameter_snapshot)
+        _restore_trainable_gradients(parameters, gradient_snapshot)
+        if optimizer_snapshot is not None:
+            _restore_optimizer_state(optimizer, optimizer_snapshot)
+        _apply_flat_gradient_step(
+            parameters=parameters,
+            flat_gradient=flat_gradient,
+            step_size=step_size,
+        )
+        return _GuardrailDecision(
+            handled_update=True,
+            committed_update=name,
+            backtracks=0,
+            fallback_used=True,
+            skipped_update=False,
+        )
+
+    _restore_trainable_parameters(parameters, parameter_snapshot)
+    _restore_trainable_gradients(parameters, gradient_snapshot)
+    if optimizer_snapshot is not None:
+        _restore_optimizer_state(optimizer, optimizer_snapshot)
+    return _GuardrailDecision(
+        handled_update=True,
+        committed_update="skip_update",
+        backtracks=0,
+        fallback_used=False,
+        skipped_update=True,
+    )
+
+
+def _try_backtracked_adamw_update(
+    *,
+    unet: UNet2DConditionModel,
+    optimizer,
+    parameters: list[torch.nn.Parameter],
+    parameter_snapshot: list[torch.Tensor],
+    gradient_snapshot: list[torch.Tensor | None],
+    optimizer_snapshot,
+    probe_batches: list[_ProbeBatch],
+    noise_scheduler: DDPMScheduler,
+    weight_dtype: torch.dtype,
+    context_ids: tuple[int, ...],
+    old_context_losses: torch.Tensor,
+    step_size: float,
+    factor: float,
+    backtracks: int,
+) -> StepCertificate:
+    _restore_trainable_parameters(parameters, parameter_snapshot)
+    _restore_trainable_gradients(parameters, gradient_snapshot)
+    _restore_optimizer_state(optimizer, optimizer_snapshot)
+    before = _snapshot_trainable_parameters(parameters)
+    optimizer.step()
+    _scale_trainable_update(
+        parameters=parameters,
+        before=before,
+        factor=factor,
+    )
+    with torch.no_grad():
+        new_context_losses = _evaluate_probe_context_losses(
+            probe_batches=probe_batches,
+            unet=unet,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+            context_ids=context_ids,
+        )
+    return certify_losses(
+        old_context_losses=old_context_losses,
+        new_context_losses=new_context_losses,
+        backtracks=backtracks,
+        step_size=step_size,
+        context_ids=context_ids,
+    )
 
 def _evaluate_probe_context_losses(
     *,
@@ -1542,7 +1811,7 @@ def _restore_trainable_gradients(
 def _snapshot_optimizer_state(optimizer):
     try:
         return copy.deepcopy(optimizer.state_dict())
-    except Exception:
+    except (RuntimeError, TypeError, ValueError):
         return None
 
 
@@ -1563,6 +1832,18 @@ def _restore_trainable_parameters(
 ) -> None:
     for parameter, value in zip(parameters, snapshot, strict=True):
         parameter.copy_(value)
+
+
+@torch.no_grad()
+def _scale_trainable_update(
+    *,
+    parameters: list[torch.nn.Parameter],
+    before: list[torch.Tensor],
+    factor: float,
+) -> None:
+    for parameter, previous in zip(parameters, before, strict=True):
+        update = parameter.detach() - previous.to(device=parameter.device)
+        parameter.copy_(previous.to(device=parameter.device) + update * float(factor))
 
 
 @torch.no_grad()

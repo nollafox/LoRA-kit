@@ -74,6 +74,7 @@ class TrainingResult:
     dry_run: bool = False
     plan: dict[str, object] | None = None
     probe_log: Path | None = None
+    probe_summary: Path | None = None
 
 
 @dataclass(frozen=True)

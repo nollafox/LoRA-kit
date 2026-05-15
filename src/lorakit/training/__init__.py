@@ -72,6 +72,7 @@ def train(paths: Paths, spec: TrainingSpec) -> TrainingResult:
         artifact_dir=artifact_dir,
         run_name=run_name,
         probe_log=archived_artifacts.get("context-probes.jsonl"),
+        probe_summary=archived_artifacts.get("context-probes-summary.json"),
     )
 
 

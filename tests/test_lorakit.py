@@ -1236,9 +1236,14 @@ def test_diffusers_streaming_probe_does_not_mutate_existing_grads(tmp_path):
 
     class FakeScheduler:
         config = FakeSchedulerConfig()
+        alphas_cumprod = torch.linspace(0.99, 0.01, 10)
 
         def add_noise(self, latents, noise, timesteps):
             return latents + noise
+
+    class EmptyDataset:
+        def __len__(self):
+            return 0
 
     class FakeUnet(torch.nn.Module):
         def __init__(self):
@@ -1262,9 +1267,12 @@ def test_diffusers_streaming_probe_does_not_mutate_existing_grads(tmp_path):
     noise = torch.zeros(2, 1, 1, 1)
     timesteps = torch.tensor([1, 2])
     unet.weight.grad = torch.tensor(123.0)
+    optimizer = torch.optim.SGD(unet.parameters(), lr=0.01)
 
     diffusers_backend._write_streaming_context_probe_if_main(
         unet=unet,
+        optimizer=optimizer,
+        dataset=EmptyDataset(),
         batch=batch,
         noise_scheduler=FakeScheduler(),
         weight_dtype=torch.float32,
@@ -1273,12 +1281,205 @@ def test_diffusers_streaming_probe_does_not_mutate_existing_grads(tmp_path):
         probe_log_path=tmp_path / "probe.jsonl",
         step=7,
         should_log=True,
+        requested_batch_size=2,
+        gradient_accumulation=1,
+        training_loss=torch.tensor(1.0),
+        candidate_step_size=0.01,
+        cuda_memory_before_probe=None,
     )
 
     assert float(unet.weight.grad.item()) == pytest.approx(123.0)
     payload = json.loads((tmp_path / "probe.jsonl").read_text(encoding="utf-8"))
     assert payload["step"] == 7
     assert payload["context_ids"] == [1, 2]
+
+
+def test_diffusers_guardrail_commits_adamw_when_certificate_passes():
+    from lorakit.training import certified_stepper
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    parameter.grad = torch.tensor([1.0])
+    parameter_snapshot = diffusers_backend._snapshot_trainable_parameters([parameter])
+    gradient_snapshot = diffusers_backend._snapshot_trainable_gradients([parameter])
+    optimizer_snapshot = diffusers_backend._snapshot_optimizer_state(optimizer)
+    certificate = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0]),
+        new_context_losses=torch.tensor([0.9]),
+        backtracks=0,
+        step_size=0.1,
+    )
+
+    decision = diffusers_backend._commit_certified_guardrail_update(
+        unet=None,
+        optimizer=optimizer,
+        parameters=[parameter],
+        parameter_snapshot=parameter_snapshot,
+        gradient_snapshot=gradient_snapshot,
+        optimizer_snapshot=optimizer_snapshot,
+        probe_batches=[],
+        noise_scheduler=None,
+        weight_dtype=torch.float32,
+        context_ids=(1,),
+        old_context_losses=torch.tensor([1.0]),
+        candidate_gradients={},
+        candidate_certificates={"adamw_actual": certificate},
+        step_size=0.1,
+    )
+
+    assert decision.committed_update == "adamw_actual"
+    assert decision.handled_update
+    assert float(parameter.item()) < 1.0
+
+
+def test_diffusers_guardrail_backtracks_adamw_when_full_step_fails(monkeypatch):
+    from lorakit.training import certified_stepper
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    parameter.grad = torch.tensor([1.0])
+    parameter_snapshot = diffusers_backend._snapshot_trainable_parameters([parameter])
+    gradient_snapshot = diffusers_backend._snapshot_trainable_gradients([parameter])
+    optimizer_snapshot = diffusers_backend._snapshot_optimizer_state(optimizer)
+    rejected = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0]),
+        new_context_losses=torch.tensor([1.2]),
+        backtracks=0,
+        step_size=1.0,
+    )
+    monkeypatch.setattr(
+        diffusers_backend,
+        "_evaluate_probe_context_losses",
+        lambda **_: torch.tensor([float(parameter.item() ** 2)]),
+    )
+
+    decision = diffusers_backend._commit_certified_guardrail_update(
+        unet=None,
+        optimizer=optimizer,
+        parameters=[parameter],
+        parameter_snapshot=parameter_snapshot,
+        gradient_snapshot=gradient_snapshot,
+        optimizer_snapshot=optimizer_snapshot,
+        probe_batches=[],
+        noise_scheduler=None,
+        weight_dtype=torch.float32,
+        context_ids=(1,),
+        old_context_losses=torch.tensor([1.0]),
+        candidate_gradients={},
+        candidate_certificates={"adamw_actual": rejected},
+        step_size=1.0,
+    )
+
+    assert decision.committed_update == "adamw_actual_backtracked"
+    assert decision.backtracks == 1
+    assert float(parameter.item()) == pytest.approx(0.5)
+
+
+def test_diffusers_guardrail_skips_update_when_all_candidates_fail(monkeypatch):
+    from lorakit.training import certified_stepper
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    parameter.grad = torch.tensor([1.0])
+    parameter_snapshot = diffusers_backend._snapshot_trainable_parameters([parameter])
+    gradient_snapshot = diffusers_backend._snapshot_trainable_gradients([parameter])
+    optimizer_snapshot = diffusers_backend._snapshot_optimizer_state(optimizer)
+    rejected = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0]),
+        new_context_losses=torch.tensor([1.2]),
+        backtracks=0,
+        step_size=1.0,
+    )
+    monkeypatch.setattr(
+        diffusers_backend,
+        "_evaluate_probe_context_losses",
+        lambda **_: torch.tensor([2.0]),
+    )
+
+    decision = diffusers_backend._commit_certified_guardrail_update(
+        unet=None,
+        optimizer=optimizer,
+        parameters=[parameter],
+        parameter_snapshot=parameter_snapshot,
+        gradient_snapshot=gradient_snapshot,
+        optimizer_snapshot=optimizer_snapshot,
+        probe_batches=[],
+        noise_scheduler=None,
+        weight_dtype=torch.float32,
+        context_ids=(1,),
+        old_context_losses=torch.tensor([1.0]),
+        candidate_gradients={"mgda_sgd_proxy": torch.tensor([1.0])},
+        candidate_certificates={"adamw_actual": rejected, "mgda_sgd_proxy": rejected},
+        step_size=1.0,
+    )
+
+    assert decision.committed_update == "skip_update"
+    assert decision.skipped_update
+    assert float(parameter.item()) == pytest.approx(1.0)
+
+
+def test_diffusers_probe_summary_counts_guardrail_outcomes(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    probe_log = tmp_path / "context-probes.jsonl"
+    probe_log.write_text(
+        "\n".join(
+            [
+                json.dumps({"probe_status": "started", "step": 0}),
+                json.dumps(
+                    {
+                        "dual_thickness": 1.0,
+                        "negative_cosine_fraction": 0.5,
+                        "candidate_certificates": {
+                            "adamw_actual": {"accepted_bottleneck": True}
+                        },
+                        "candidate_selection": {
+                            "guardrail": {
+                                "committed_update": "adamw_actual",
+                                "fallback_used": False,
+                                "skipped_update": False,
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "dual_thickness": 3.0,
+                        "negative_cosine_fraction": 0.0,
+                        "candidate_certificates": {
+                            "adamw_actual": {"accepted_bottleneck": False}
+                        },
+                        "candidate_selection": {
+                            "guardrail": {
+                                "committed_update": "mgda_sgd_proxy",
+                                "fallback_used": True,
+                                "skipped_update": False,
+                            }
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary_path = tmp_path / "context-probes-summary.json"
+
+    diffusers_backend._write_probe_summary(
+        probe_log_path=probe_log,
+        summary_path=summary_path,
+    )
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["probe_count"] == 2
+    assert summary["adamw_selected"] == 1
+    assert summary["adamw_rejected"] == 1
+    assert summary["fallback_used"] == 1
+    assert summary["mean_dual_thickness"] == pytest.approx(2.0)
+    assert summary["conflict_probe_fraction"] == pytest.approx(0.5)
 
 
 def test_certified_stepper_projects_to_simplex():
@@ -1366,6 +1567,91 @@ def test_certified_stepper_certify_losses_accepts_non_worsening_update():
     assert certificate.max_delta == pytest.approx(0.0)
 
 
+def test_certified_stepper_accepts_tiny_positive_delta_within_tolerance():
+    from lorakit.training import certified_stepper
+
+    certificate = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0, 2.0]),
+        new_context_losses=torch.tensor([1.0 + 1e-7, 2.0 - 1e-6]),
+        backtracks=0,
+        step_size=1.0,
+        tolerance=1e-5,
+    )
+
+    assert certificate.accepted_tolerant
+    assert certificate.accepted_strong
+    assert not certificate.accepted_strict
+    assert certificate.reason == "accepted_strong_no_context_worsened_beyond_tolerance"
+
+
+def test_certified_stepper_bottleneck_acceptance_allows_non_bottleneck_tolerance_overrun():
+    from lorakit.training import certified_stepper
+
+    certificate = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0, 3.0]),
+        new_context_losses=torch.tensor([1.1, 2.8]),
+        backtracks=0,
+        step_size=1.0,
+        tolerance=0.05,
+    )
+
+    assert certificate.accepted_bottleneck
+    assert not certificate.accepted_strong
+    assert certificate.acceptance_level == "bottleneck"
+    assert certificate.worsened_context_ids == (0,)
+
+
+def test_certified_stepper_candidate_selection_prefers_lower_max_delta():
+    from lorakit.training import certified_stepper
+
+    worse = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0, 1.0]),
+        new_context_losses=torch.tensor([0.95, 0.99]),
+        backtracks=0,
+        step_size=1.0,
+        tolerance=1e-5,
+    )
+    better = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0, 1.0]),
+        new_context_losses=torch.tensor([0.90, 0.98]),
+        backtracks=0,
+        step_size=1.0,
+        tolerance=1e-5,
+    )
+
+    selection = certified_stepper.select_preferred_candidate(
+        {"worse": worse, "better": better},
+    )
+
+    assert selection["selected"] == "better"
+
+
+def test_certified_stepper_candidate_selection_falls_back_from_rejected_preference():
+    from lorakit.training import certified_stepper
+
+    rejected = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0, 1.0]),
+        new_context_losses=torch.tensor([1.2, 1.0]),
+        backtracks=0,
+        step_size=1.0,
+        tolerance=1e-5,
+    )
+    accepted = certified_stepper.certify_losses(
+        old_context_losses=torch.tensor([1.0, 1.0]),
+        new_context_losses=torch.tensor([0.99, 1.0]),
+        backtracks=0,
+        step_size=1.0,
+        tolerance=1e-5,
+    )
+
+    selection = certified_stepper.select_preferred_candidate(
+        {"adamw_actual": rejected, "mgda_sgd_proxy": accepted},
+    )
+
+    assert selection["selected"] == "mgda_sgd_proxy"
+    assert selection["would_replace_committed_update"]
+
+
 def test_certified_stepper_certify_losses_rejects_context_increase():
     from lorakit.training import certified_stepper
 
@@ -1433,9 +1719,11 @@ def test_training_invokes_backend_and_archives_artifacts(tmp_path, monkeypatch):
             model_path.write_bytes(b"lora")
             probe_log_path = spec.output_dir / "context-probes.jsonl"
             probe_log_path.write_text('{"step": 0}\n', encoding="utf-8")
+            probe_summary_path = spec.output_dir / "context-probes-summary.json"
+            probe_summary_path.write_text('{"probe_count": 1}\n', encoding="utf-8")
             return BackendResult(
                 model_path=model_path,
-                artifact_paths=(probe_log_path,),
+                artifact_paths=(probe_log_path, probe_summary_path),
             )
 
     monkeypatch.setattr(training_module, "get_backend", lambda name: FakeBackend())
@@ -1450,6 +1738,8 @@ def test_training_invokes_backend_and_archives_artifacts(tmp_path, monkeypatch):
     assert (result.artifact_dir / "model.safetensors").read_bytes() == b"lora"
     assert result.probe_log == result.artifact_dir / "context-probes.jsonl"
     assert result.probe_log.read_text(encoding="utf-8") == '{"step": 0}\n'
+    assert result.probe_summary == result.artifact_dir / "context-probes-summary.json"
+    assert result.probe_summary.read_text(encoding="utf-8") == '{"probe_count": 1}\n'
     assert not (result.artifact_dir / "working").exists()
 
 

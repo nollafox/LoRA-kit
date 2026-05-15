@@ -575,8 +575,8 @@ def select_preferred_candidate(
     """Rank candidate certificates without mutating model state.
 
     Preference order:
-        1. strong certificates
-        2. bottleneck certificates
+        1. bottleneck certificates
+        2. strong certificates
         3. lower max-delta
         4. lower mean-delta
         5. smaller update norm
@@ -590,13 +590,13 @@ def select_preferred_candidate(
             "would_replace_committed_update": False,
         }
 
-    level_rank = {"reject": 0, "bottleneck": 1, "strong": 2}
     norms = update_norms or {}
 
-    def sort_key(item: tuple[str, StepCertificate]) -> tuple[float, float, float, float]:
+    def sort_key(item: tuple[str, StepCertificate]) -> tuple[float, float, float, float, float]:
         name, cert = item
         return (
-            -float(level_rank.get(cert.acceptance_level, 0)),
+            -float(cert.accepted_bottleneck),
+            -float(cert.accepted_strong),
             float(cert.max_delta),
             float(cert.mean_delta),
             float(norms.get(name, 0.0)),
@@ -654,7 +654,7 @@ def certify_losses(
     mean_delta = new_mean - old_mean
     max_delta = new_max - old_max
 
-    accepted_strict = max_delta <= 0.0 and mean_delta <= 0.0
+    accepted_strict = mean_delta <= 0.0 and bool(torch.all(deltas <= 0.0).item())
     accepted_tolerant = max_delta <= tolerance and mean_delta <= tolerance
     accepted_strong = accepted_tolerant and bool(torch.all(deltas <= float(tolerance)).item())
     accepted_bottleneck = accepted_tolerant
@@ -676,7 +676,7 @@ def certify_losses(
     )
 
     if accepted_strong:
-        reason = "accepted_strong_no_context_worsened"
+        reason = "accepted_strong_no_context_worsened_beyond_tolerance"
     elif accepted_bottleneck:
         reason = "accepted_bottleneck_mean_and_max_nonworsening"
     else:
