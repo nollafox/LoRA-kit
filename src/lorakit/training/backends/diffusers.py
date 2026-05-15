@@ -1,3 +1,21 @@
+"""Diffusers LoRA training backend.
+
+This backend is intentionally zero-config from the CLI side.  Internally it uses
+heldout SNR-bucket validation to select checkpoints and to activate quality
+challengers only when their virtual one-step validation score improves beyond a
+scale-aware tolerance.
+
+Key non-heuristic invariants:
+- Latent cache is deterministic: posterior mode when available, otherwise mean.
+- LoRA+ is implemented as actual AdamW param-group learning-rate ratios, not by
+  scaling gradients before Adam's moment normalization.
+- Objective / LoRA+ challenger comparisons use the same frozen training
+  perturbation: identical batch, timesteps, and noise.
+- Rank growth is triggered by validation plateau and uses dense base-weight
+  validation gradients split into signal/noise estimates.  New rank channels are
+  no-op initialized so model outputs are unchanged at insertion time.
+"""
+
 import copy
 import gc
 import hashlib
@@ -533,6 +551,7 @@ def train(spec: BackendSpec) -> BackendResult:
                         challenger_log["rank_probe"] = _maybe_grow_lora_rank(
                             unet=unet,
                             optimizer=optimizer,
+                            scheduler=scheduler,
                             validation_skeleton=validation_skeleton,
                             baseline_report=validation_report,
                             noise_scheduler=noise_scheduler,
@@ -1098,11 +1117,53 @@ def _add_lora_named_parameters_to_optimizer(
     b_params = [p for name, p in named_parameters if "lora_B" in name and p.requires_grad]
     other_params = [p for name, p in named_parameters if "lora_A" not in name and "lora_B" not in name and p.requires_grad]
     if a_params:
-        optimizer.add_param_group({"params": a_params, "lr": float(base_learning_rate), "lorakit_group": "lora_A"})
+        optimizer.add_param_group({"params": a_params, "lr": float(base_learning_rate), "initial_lr": float(base_learning_rate), "lorakit_group": "lora_A"})
     if b_params:
-        optimizer.add_param_group({"params": b_params, "lr": float(base_learning_rate) * float(ratio), "lorakit_group": "lora_B"})
+        optimizer.add_param_group({"params": b_params, "lr": float(base_learning_rate) * float(ratio), "initial_lr": float(base_learning_rate) * float(ratio), "lorakit_group": "lora_B"})
     if other_params:
-        optimizer.add_param_group({"params": other_params, "lr": float(base_learning_rate), "lorakit_group": "default"})
+        optimizer.add_param_group({"params": other_params, "lr": float(base_learning_rate), "initial_lr": float(base_learning_rate), "lorakit_group": "default"})
+
+
+
+def _sync_scheduler_param_groups_after_optimizer_growth(
+    *,
+    scheduler,
+    optimizer,
+    groups_before: int,
+) -> None:
+    """Keep torch/accelerate schedulers consistent after dynamic optimizer growth.
+
+    PyTorch LR schedulers keep one base LR per optimizer parameter group.  Dynamic
+    rank growth adds optimizer groups after scheduler creation, so the scheduler
+    must receive matching base_lrs entries before its next step().
+    """
+    groups_after = len(optimizer.param_groups)
+    if groups_after <= groups_before:
+        return
+
+    wrapped_scheduler = getattr(scheduler, "scheduler", scheduler)
+    new_base_lrs = [
+        float(group.get("initial_lr", group.get("lr", 0.0)))
+        for group in optimizer.param_groups[groups_before:]
+    ]
+
+    if hasattr(wrapped_scheduler, "base_lrs"):
+        wrapped_scheduler.base_lrs.extend(new_base_lrs)
+
+    if hasattr(wrapped_scheduler, "_last_lr"):
+        last_lr = list(getattr(wrapped_scheduler, "_last_lr", []))
+        last_lr.extend(float(group.get("lr", base_lr)) for group, base_lr in zip(
+            optimizer.param_groups[groups_before:],
+            new_base_lrs,
+            strict=True,
+        ))
+        wrapped_scheduler._last_lr = last_lr
+
+    # Some schedulers also track per-group initial_lr.  PyTorch normally sets
+    # this when a scheduler is created, but dynamically added groups need it too.
+    for group in optimizer.param_groups[groups_before:]:
+        group.setdefault("initial_lr", float(group.get("lr", 0.0)))
+
 
 
 def _batch_tensor(batch: dict[str, object], key: str) -> torch.Tensor:
@@ -2353,6 +2414,7 @@ def _maybe_grow_lora_rank(
     *,
     unet: UNet2DConditionModel,
     optimizer,
+    scheduler,
     validation_skeleton: _ValidationSkeleton,
     baseline_report: _ValidationReport,
     noise_scheduler: DDPMScheduler,
@@ -2419,6 +2481,7 @@ def _maybe_grow_lora_rank(
         for layer, adapter, snapshot, _new_named_parameters in grown:
             _restore_lora_layer(layer=layer, adapter=adapter, snapshot=snapshot)
     else:
+        groups_before = len(optimizer.param_groups)
         for _layer, _adapter, _snapshot, new_named_parameters in grown:
             if new_named_parameters:
                 _add_lora_named_parameters_to_optimizer(
@@ -2427,6 +2490,11 @@ def _maybe_grow_lora_rank(
                     base_learning_rate=base_learning_rate,
                     ratio=lora_plus_ratio,
                 )
+        _sync_scheduler_param_groups_after_optimizer_growth(
+            scheduler=scheduler,
+            optimizer=optimizer,
+            groups_before=groups_before,
+        )
 
     return {
         "trigger": "validation_plateau",
