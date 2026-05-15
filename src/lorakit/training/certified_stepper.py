@@ -9,6 +9,20 @@ import torch
 import torch.nn.functional as F
 
 
+DEFAULT_CERTIFICATE_ABSOLUTE_FLOOR = 1e-7
+DEFAULT_CERTIFICATE_RELATIVE_TOLERANCE = 1e-5
+DEFAULT_MGDA_MAX_ITERATIONS = 250
+DEFAULT_MGDA_TOLERANCE = 1e-10
+LAMBDA_SUPPORT_TOLERANCE = 1e-6
+NUMERICAL_EPSILON = 1e-12
+SIMPLEX_TOTAL = 1.0
+ACCEPTANCE_LEVEL_RANKS = {
+    "reject": 0,
+    "bottleneck": 1,
+    "strong": 2,
+}
+
+
 @dataclass(frozen=True)
 class ContextProbe:
     context_ids: tuple[int, ...]
@@ -156,26 +170,26 @@ def project_to_simplex(vector: torch.Tensor) -> torch.Tensor:
         return torch.ones_like(values)
 
     sorted_values, _ = torch.sort(values, descending=True)
-    cumulative = torch.cumsum(sorted_values, dim=0) - 1.0
+    cumulative = torch.cumsum(sorted_values, dim=0) - SIMPLEX_TOTAL
     positions = torch.arange(1, count + 1, device=values.device, dtype=values.dtype)
     active = sorted_values - cumulative / positions > 0
     if not torch.any(active):
-        return torch.full_like(values, 1.0 / count)
+        return torch.full_like(values, SIMPLEX_TOTAL / count)
 
     rho = torch.nonzero(active, as_tuple=False)[-1].item()
     theta = cumulative[rho] / float(rho + 1)
     projected = torch.clamp(values - theta, min=0.0)
     total = projected.sum()
     if total <= 0:
-        return torch.full_like(values, 1.0 / count)
+        return torch.full_like(values, SIMPLEX_TOTAL / count)
     return projected / total
 
 
 def solve_mgda_weights(
     gradient_dot: torch.Tensor,
     *,
-    max_iter: int = 250,
-    tolerance: float = 1e-10,
+    max_iter: int = DEFAULT_MGDA_MAX_ITERATIONS,
+    tolerance: float = DEFAULT_MGDA_TOLERANCE,
 ) -> torch.Tensor:
     """Solve the MGDA minimum-norm simplex weights from a gradient Gram matrix."""
     gram = gradient_dot.detach().float().cpu()
@@ -189,10 +203,10 @@ def solve_mgda_weights(
         return torch.ones(1, dtype=torch.float32)
 
     gram = 0.5 * (gram + gram.T)
-    gram = gram + torch.eye(context_count, dtype=gram.dtype) * 1e-12
-    weights = torch.full((context_count,), 1.0 / context_count, dtype=torch.float32)
+    gram = gram + torch.eye(context_count, dtype=gram.dtype) * NUMERICAL_EPSILON
+    weights = torch.full((context_count,), SIMPLEX_TOTAL / context_count, dtype=torch.float32)
     lipschitz = torch.linalg.norm(gram, ord=2).item()
-    step_size = 1.0 / max(lipschitz, 1e-12)
+    step_size = SIMPLEX_TOTAL / max(lipschitz, NUMERICAL_EPSILON)
     previous_objective: float | None = None
 
     for _ in range(max_iter):
@@ -219,7 +233,7 @@ def cosine_from_gram(gram: torch.Tensor) -> torch.Tensor:
     if gram.ndim != 2 or gram.shape[0] != gram.shape[1]:
         raise ValueError("gram must be square")
     norms = torch.sqrt(torch.clamp(torch.diag(gram), min=0.0))
-    denominator = torch.outer(norms, norms).clamp_min(1e-12)
+    denominator = torch.outer(norms, norms).clamp_min(NUMERICAL_EPSILON)
     cosine = gram / denominator
     return torch.clamp(cosine, min=-1.0, max=1.0)
 
@@ -288,7 +302,7 @@ def probe_from_context_losses(
     pareto_gap = float(max(mgda_squared_norm, 0.0) ** 0.5)
 
     weight_norm_squared = float(weights @ weights)
-    dual_thickness = float(1.0 / max(weight_norm_squared, 1e-12))
+    dual_thickness = float(SIMPLEX_TOTAL / max(weight_norm_squared, NUMERICAL_EPSILON))
 
     (
         pair_count,
@@ -314,8 +328,7 @@ def probe_from_context_losses(
     max_loss_index = int(torch.argmax(losses).item())
     max_lambda_index = int(torch.argmax(weights_cpu).item())
 
-    lambda_support_tolerance = 1e-6
-    lambda_support = int((weights_cpu > lambda_support_tolerance).sum().item())
+    lambda_support = int((weights_cpu > LAMBDA_SUPPORT_TOLERANCE).sum().item())
 
     return ContextProbe(
         context_ids=context_ids,
@@ -404,7 +417,7 @@ def _normalize_weights(values: torch.Tensor) -> torch.Tensor:
         raise ValueError("weights must be nonnegative")
     total = float(weights.sum().item())
     if total <= 0:
-        return torch.full_like(weights, 1.0 / weights.numel())
+        return torch.full_like(weights, SIMPLEX_TOTAL / weights.numel())
     return weights / total
 
 
@@ -420,7 +433,7 @@ def normalized_count_weights(context_counts: Sequence[int]) -> torch.Tensor:
 def uniform_context_weights(context_count: int) -> torch.Tensor:
     if context_count <= 0:
         raise ValueError("context_count must be positive")
-    return torch.full((context_count,), 1.0 / context_count, dtype=torch.float32)
+    return torch.full((context_count,), SIMPLEX_TOTAL / context_count, dtype=torch.float32)
 
 
 def weighted_gradient(
@@ -444,8 +457,8 @@ def candidate_first_order_summaries(
     gradients: Sequence[torch.Tensor],
     mgda_weights: torch.Tensor,
     context_counts: Sequence[int] | None = None,
-    step_size: float = 1.0,
-    tolerance: float = 1e-12,
+    step_size: float = SIMPLEX_TOTAL,
+    tolerance: float = NUMERICAL_EPSILON,
 ) -> dict[str, object]:
     """Summarize first-order context-loss changes for candidate descent directions.
 
@@ -463,7 +476,10 @@ def candidate_first_order_summaries(
 
     context_count = len(context_ids)
     losses = context_losses.detach().float().cpu()
-    gradient_matrix = torch.stack([gradient.detach().float().cpu() for gradient in gradients], dim=0)
+    gradient_matrix = torch.stack(
+        [gradient.detach().float().cpu() for gradient in gradients],
+        dim=0,
+    )
 
     candidates: dict[str, torch.Tensor] = {
         "mean_context_sgd_proxy": uniform_context_weights(context_count),
@@ -515,14 +531,15 @@ def weighted_context_loss(
         raise ValueError("context_losses must be rank-1")
     if weights.shape != context_losses.shape:
         raise ValueError("weights/context loss shape mismatch")
-    return torch.sum(weights.to(device=context_losses.device, dtype=context_losses.dtype) * context_losses)
+    normalized_weights = weights.to(device=context_losses.device, dtype=context_losses.dtype)
+    return torch.sum(normalized_weights * context_losses)
 
 
 def adaptive_certificate_tolerance(
     context_losses: torch.Tensor,
     *,
-    absolute_floor: float = 1e-7,
-    relative: float = 1e-5,
+    absolute_floor: float = DEFAULT_CERTIFICATE_ABSOLUTE_FLOOR,
+    relative: float = DEFAULT_CERTIFICATE_RELATIVE_TOLERANCE,
 ) -> float:
     """Return a scale-aware tolerance for frozen-probe candidate certificates."""
     losses = context_losses.detach().float().cpu()
@@ -590,16 +607,22 @@ def select_preferred_candidate(
             "would_replace_committed_update": False,
         }
 
-    level_rank = {"reject": 0, "bottleneck": 1, "strong": 2}
-    norms = update_norms or {}
+    if update_norms is not None:
+        missing_names = set(certificates) - set(update_norms)
+        if missing_names:
+            missing = ", ".join(sorted(missing_names))
+            raise ValueError(f"Missing update norm for candidate(s): {missing}")
 
     def sort_key(item: tuple[str, StepCertificate]) -> tuple[float, float, float, float]:
-        name, cert = item
+        name, certificate = item
+        if certificate.acceptance_level not in ACCEPTANCE_LEVEL_RANKS:
+            raise ValueError(f"Unknown acceptance level: {certificate.acceptance_level}")
+        update_norm = 0.0 if update_norms is None else float(update_norms[name])
         return (
-            -float(level_rank.get(cert.acceptance_level, 0)),
-            float(cert.max_delta),
-            float(cert.mean_delta),
-            float(norms.get(name, 0.0)),
+            -float(ACCEPTANCE_LEVEL_RANKS[certificate.acceptance_level]),
+            float(certificate.max_delta),
+            float(certificate.mean_delta),
+            update_norm,
         )
 
     ordered = sorted(certificates.items(), key=sort_key)

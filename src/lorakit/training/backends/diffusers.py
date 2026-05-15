@@ -18,21 +18,19 @@ Key non-heuristic invariants:
 
 import copy
 import gc
-import hashlib
 import json
-import random
 import shutil
+from importlib.util import find_spec
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Iterable
 
 import torch
 from accelerate import Accelerator
+from bitsandbytes.optim import AdamW8bit
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
-from PIL import Image
-from torch.utils.data import BatchSampler, DataLoader, Dataset
-from torchvision import transforms
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -41,7 +39,37 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import convert_state_dict_to_diffusers
 
 from lorakit.errors import LorakitError
-from lorakit.manifest import MANIFEST_NAME, read_manifest
+from lorakit.training.backends._cache import (
+    CACHE_DIR_NAME,
+    CACHE_MANIFEST_NAME,
+    CacheRecord as _CacheRecord,
+    DiskCachedLatentDataset as _DiskCachedLatentDataset,
+    LatentShapeBatchSampler as _LatentShapeBatchSampler,
+    cache_encoder_hidden_states as _cache_encoder_hidden_states,
+    cache_latents as _cache_latents,
+    cache_records as _cache_records,
+    cleanup_after_cuda_oom as _cleanup_after_cuda_oom,
+    collate_cached as _collate_cached,
+    is_cuda_oom as _is_cuda_oom,
+    load_rows as _load_rows,
+    load_tensor as _load_tensor,
+    write_cache_manifest as _write_cache_manifest,
+)
+from lorakit.training.backends._validation import (
+    BestCheckpoint as _BestCheckpoint,
+    ValidationItem as _ValidationItem,
+    ValidationReport as _ValidationReport,
+    ValidationSkeleton as _ValidationSkeleton,
+    build_validation_skeleton as _build_validation_skeleton,
+    evaluate_validation_skeleton as _evaluate_validation_skeleton_from_items,
+    select_best_checkpoint as _select_best_checkpoint,
+    snr_for_timesteps as _snr_for_timesteps,
+    split_train_validation_records as _split_train_validation_records,
+    validation_delta_log as _validation_delta_log,
+    validation_score_improves as _validation_score_improves,
+    validation_score_nonworse as _validation_score_nonworse,
+    write_validation_report_if_main as _write_validation_report_if_main,
+)
 from lorakit.training.backends.types import BackendResult, BackendSpec
 from lorakit.training.certified_stepper import (
     StepCertificate,
@@ -62,24 +90,13 @@ LORA_WEIGHTS_NAME = "pytorch_lora_weights.safetensors"
 BEST_LORA_WEIGHTS_NAME = "best_lora_weights.safetensors"
 MAX_GRAD_NORM = 1.0
 LR_WARMUP_STEPS = 0
-VAE_DOWNSAMPLE_FACTOR: Final = 8
 
-VALIDATION_FRACTION: Final = 0.08
-VALIDATION_MAX_ITEMS: Final = 32
 VALIDATION_EVERY_PROBES: Final = 1
-VALIDATION_SNR_BUCKETS: Final = ("high", "mid", "low")
-VALIDATION_SCORE_ABSOLUTE_TOLERANCE: Final = 1e-7
-VALIDATION_SCORE_RELATIVE_TOLERANCE: Final = 1e-5
 
 RANK_GROWTH_MAX_CHANNELS: Final = 2
 RANK_GROWTH_MIN_FREE_CUDA_BYTES: Final = 1_000_000_000
 RANK_GROWTH_NOISE_MULTIPLIER: Final = 2.858
 
-CACHE_ENCODING_MAX_BATCH_SIZE: Final = 4
-CACHE_ENCODING_MIN_BATCH_SIZE: Final = 1
-CACHE_DIR_NAME: Final = "tensor-cache"
-CACHE_MANIFEST_NAME: Final = "manifest.json"
-LATENT_CACHE_MODE: Final = "posterior_mode"
 
 PROBE_LOG_NAME = "context-probes.jsonl"
 PROBE_SUMMARY_NAME = "context-probes-summary.json"
@@ -89,63 +106,6 @@ PROBE_MIN_FREE_CUDA_BYTES: Final = 500_000_000
 PROBE_WINDOW_TARGET_ITEMS: Final = 4
 PROBE_VERSION: Final = 5
 CERTIFIED_BACKTRACK_FACTORS: Final = (1.0, 0.5, 0.25, 0.125)
-HASH_CHUNK_SIZE_BYTES: Final = 1024 * 1024
-
-
-@dataclass(frozen=True)
-class _TrainingRow:
-    image: str
-    caption: str
-    image_path: Path
-    image_sha256: str
-    width: int
-    height: int
-
-
-@dataclass(frozen=True)
-class _CacheRecord:
-    image: str
-    caption_sha256: str
-    image_sha256: str
-    latent_path: Path
-    encoder_hidden_state_path: Path
-    latent_shape: tuple[int, ...]
-    encoder_hidden_state_shape: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class _ValidationItem:
-    record: _CacheRecord
-    timestep: int
-    noise_seed: int
-    snr: float
-    snr_bucket: str
-
-
-@dataclass(frozen=True)
-class _ValidationSkeleton:
-    items: tuple[_ValidationItem, ...]
-
-
-@dataclass(frozen=True)
-class _ValidationReport:
-    step: int
-    loss_mean: float
-    loss_max_snr_bucket: float
-    loss_by_snr_bucket: dict[str, float]
-    item_count: int
-
-
-@dataclass(frozen=True)
-class _BestCheckpoint:
-    path: Path
-    step: int | None
-    loss_max_snr_bucket: float | None
-    loss_mean: float | None
-
-    @classmethod
-    def empty(cls, path: Path) -> "_BestCheckpoint":
-        return cls(path=path, step=None, loss_max_snr_bucket=None, loss_mean=None)
 
 
 @dataclass(frozen=True)
@@ -207,59 +167,6 @@ class _Components:
         self.unet = unet
 
 
-class _DiskCachedLatentDataset(Dataset):
-    def __init__(self, *, records: list[_CacheRecord]):
-        if not records:
-            raise LorakitError("Tensor cache has no records")
-        _assert_cache_records_are_consistent(records)
-        self._records = records
-
-    def __len__(self) -> int:
-        return len(self._records)
-
-    def __getitem__(self, index: int) -> dict[str, object]:
-        record = self._records[index]
-        return {
-            "latents": _load_tensor(record.latent_path, expected_shape=record.latent_shape),
-            "encoder_hidden_states": _load_tensor(
-                record.encoder_hidden_state_path,
-                expected_shape=record.encoder_hidden_state_shape,
-            ),
-            "record_index": index,
-            "image": record.image,
-            "latent_shape": record.latent_shape,
-            "encoder_hidden_state_shape": record.encoder_hidden_state_shape,
-        }
-
-
-class _LatentShapeBatchSampler(BatchSampler):
-    def __init__(self, *, records: list[_CacheRecord], batch_size: int):
-        if batch_size <= 0:
-            raise LorakitError("Batch size must be greater than zero")
-        buckets: dict[tuple[int, ...], list[int]] = {}
-        for index, record in enumerate(records):
-            buckets.setdefault(record.latent_shape, []).append(index)
-        if not buckets:
-            raise LorakitError("Tensor cache has no latent-shape buckets")
-        self._buckets = buckets
-        self._batch_size = batch_size
-
-    def __iter__(self):
-        bucket_keys = list(self._buckets)
-        random.shuffle(bucket_keys)
-        for bucket_key in bucket_keys:
-            indices = list(self._buckets[bucket_key])
-            random.shuffle(indices)
-            for start in range(0, len(indices), self._batch_size):
-                yield indices[start : start + self._batch_size]
-
-    def __len__(self) -> int:
-        return sum(
-            (len(indices) + self._batch_size - 1) // self._batch_size
-            for indices in self._buckets.values()
-        )
-
-
 def _default_guardrail_decision() -> _GuardrailDecision:
     return _GuardrailDecision(
         handled_update=False,
@@ -275,7 +182,6 @@ def _default_training_policy() -> _TrainingPolicy:
 
 
 def train(spec: BackendSpec) -> BackendResult:
-    _require_training_acceleration_packages()
     _validate_spec(spec)
     rows = _load_rows(spec.prepared_dir)
 
@@ -463,7 +369,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             candidate_step_size=spec.learning_rate,
                             cuda_memory_before_probe=cuda_memory_before_probe,
                         )
-                    except Exception as exc:
+                    except RuntimeError as exc:
                         if not _is_cuda_oom(exc):
                             raise
                         _cleanup_after_cuda_oom()
@@ -607,15 +513,6 @@ def train(spec: BackendSpec) -> BackendResult:
 # ---------------------------------------------------------------------------
 
 
-def _require_training_acceleration_packages() -> None:
-    try:
-        import bitsandbytes  # noqa: F401
-    except ImportError as exc:
-        raise LorakitError(
-            "bitsandbytes is required for Lorakit's Diffusers backend. "
-            "Install it with: poetry run pip install bitsandbytes"
-        ) from exc
-
 
 def _validate_spec(spec: BackendSpec) -> None:
     if spec.steps <= 0:
@@ -631,11 +528,10 @@ def _validate_spec(spec: BackendSpec) -> None:
 
 
 def _enable_memory_efficient_attention(unet: UNet2DConditionModel) -> str:
-    try:
-        unet.enable_xformers_memory_efficient_attention()
-        return "xformers"
-    except Exception:
+    if find_spec("xformers") is None:
         return "torch"
+    unet.enable_xformers_memory_efficient_attention()
+    return "xformers"
 
 
 def _cast_trainable_parameters_to_fp32(module: torch.nn.Module) -> None:
@@ -716,329 +612,9 @@ def _weight_dtype(accelerator: Accelerator) -> torch.dtype:
     return torch.float32
 
 
-def _load_rows(prepared_dir: Path) -> list[_TrainingRow]:
-    rows = read_manifest(prepared_dir / MANIFEST_NAME)
-    if not rows:
-        raise LorakitError(f"Prepared dataset has no training rows: {prepared_dir}")
-
-    loaded_rows: list[_TrainingRow] = []
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            raise LorakitError(f"Prepared manifest row {index} must be an object")
-        image = row.get("image")
-        caption = row.get("caption")
-        if not isinstance(image, str) or image == "":
-            raise LorakitError(f"Prepared manifest row {index} is missing image path")
-        if not isinstance(caption, str):
-            raise LorakitError(f"Prepared manifest row {index} is missing caption")
-        image_path = prepared_dir / image
-        if not image_path.exists() or not image_path.is_file():
-            raise LorakitError(f"Prepared manifest row {index} image does not exist: {image_path}")
-        with Image.open(image_path) as opened_image:
-            width, height = opened_image.size
-        if width <= 0 or height <= 0:
-            raise LorakitError(f"Prepared image has invalid dimensions: {image_path}")
-        if width % VAE_DOWNSAMPLE_FACTOR != 0 or height % VAE_DOWNSAMPLE_FACTOR != 0:
-            raise LorakitError(
-                "Prepared image dimensions must be divisible by "
-                f"{VAE_DOWNSAMPLE_FACTOR}: {image_path} is {width}x{height}"
-            )
-        loaded_rows.append(
-            _TrainingRow(
-                image=image,
-                caption=caption,
-                image_path=image_path,
-                image_sha256=_file_sha256(image_path),
-                width=width,
-                height=height,
-            )
-        )
-    return loaded_rows
-
-
 # ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------
-
-
-def _is_cuda_oom(exc: BaseException) -> bool:
-    if isinstance(exc, torch.cuda.OutOfMemoryError):
-        return True
-    return "cuda out of memory" in str(exc).lower()
-
-
-def _cleanup_after_cuda_oom() -> None:
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-
-def _adaptive_cuda_batches(*, indices: list[int], initial_batch_size: int, encode_batch) -> None:
-    batch_size = max(CACHE_ENCODING_MIN_BATCH_SIZE, int(initial_batch_size))
-    cursor = 0
-    while cursor < len(indices):
-        current = indices[cursor : cursor + batch_size]
-        try:
-            encode_batch(current)
-            cursor += len(current)
-        except Exception as exc:
-            if not _is_cuda_oom(exc):
-                raise
-            _cleanup_after_cuda_oom()
-            if batch_size <= CACHE_ENCODING_MIN_BATCH_SIZE:
-                raise LorakitError(
-                    "CUDA out of memory while encoding a single cache item. "
-                    "Try closing other GPU processes or preparing at a smaller resolution."
-                ) from exc
-            batch_size = max(CACHE_ENCODING_MIN_BATCH_SIZE, batch_size // 2)
-
-
-@torch.no_grad()
-def _cache_encoder_hidden_states(
-    *,
-    rows: list[_TrainingRow],
-    cache_dir: Path,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> list[Path]:
-    text_cache_dir = cache_dir / "text"
-    text_cache_dir.mkdir(parents=True, exist_ok=True)
-    text_encoder.requires_grad_(False)
-    text_encoder.to(device=device, dtype=dtype)
-    text_encoder.eval()
-    cached: list[Path | None] = [None] * len(rows)
-    progress = tqdm(total=len(rows), desc="Encoding captions")
-
-    def encode_batch(batch_indices: list[int]) -> None:
-        tokens = tokenizer(
-            [rows[index].caption for index in batch_indices],
-            max_length=tokenizer.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids.to(device)
-        hidden = text_encoder(tokens, return_dict=False)[0]
-        for index, tensor in zip(batch_indices, hidden, strict=True):
-            path = text_cache_dir / f"{index:08d}.pt"
-            _save_tensor(path, tensor.detach().to(dtype=dtype).cpu())
-            cached[index] = path
-        progress.update(len(batch_indices))
-        del tokens
-        del hidden
-
-    try:
-        _adaptive_cuda_batches(
-            indices=list(range(len(rows))),
-            initial_batch_size=CACHE_ENCODING_MAX_BATCH_SIZE,
-            encode_batch=encode_batch,
-        )
-    finally:
-        progress.close()
-
-    if any(path is None for path in cached):
-        raise LorakitError("Text embedding cache did not encode every row")
-    return [path for path in cached if path is not None]
-
-
-@torch.no_grad()
-def _cache_latents(
-    *,
-    rows: list[_TrainingRow],
-    cache_dir: Path,
-    vae: AutoencoderKL,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> list[Path]:
-    latent_cache_dir = cache_dir / "latents"
-    latent_cache_dir.mkdir(parents=True, exist_ok=True)
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-    vae.requires_grad_(False)
-    vae.to(device=device, dtype=dtype)
-    vae.eval()
-    cached: list[Path | None] = [None] * len(rows)
-    shape_buckets = _pixel_shape_buckets(rows)
-    progress = tqdm(total=len(rows), desc="Encoding latents")
-
-    def encode_batch(batch_indices: list[int]) -> None:
-        pixel_batches: list[torch.Tensor] = []
-        for index in batch_indices:
-            with Image.open(rows[index].image_path) as image:
-                pixel_batches.append(transform(image.convert("RGB")))
-        pixel_values = torch.stack(pixel_batches).to(device=device, dtype=dtype)
-        latent_distribution = vae.encode(pixel_values).latent_dist
-        latents = _deterministic_latents(latent_distribution)
-        latents = latents * vae.config.scaling_factor
-        for index, tensor in zip(batch_indices, latents, strict=True):
-            path = latent_cache_dir / f"{index:08d}.pt"
-            _save_tensor(path, tensor.detach().to(dtype=dtype).cpu())
-            cached[index] = path
-        progress.update(len(batch_indices))
-        del pixel_batches
-        del pixel_values
-        del latents
-
-    try:
-        for indices in shape_buckets.values():
-            _adaptive_cuda_batches(
-                indices=indices,
-                initial_batch_size=CACHE_ENCODING_MAX_BATCH_SIZE,
-                encode_batch=encode_batch,
-            )
-    finally:
-        progress.close()
-
-    if any(path is None for path in cached):
-        raise LorakitError("Latent cache did not encode every row")
-    return [path for path in cached if path is not None]
-
-
-def _deterministic_latents(latent_distribution) -> torch.Tensor:
-    if hasattr(latent_distribution, "mode"):
-        mode = latent_distribution.mode()
-        if isinstance(mode, torch.Tensor):
-            return mode
-    mean = getattr(latent_distribution, "mean", None)
-    if isinstance(mean, torch.Tensor):
-        return mean
-    raise LorakitError("VAE latent distribution does not expose mode() or mean")
-
-
-def _pixel_shape_buckets(rows: list[_TrainingRow]) -> dict[tuple[int, int], list[int]]:
-    buckets: dict[tuple[int, int], list[int]] = {}
-    for index, row in enumerate(rows):
-        buckets.setdefault((row.width, row.height), []).append(index)
-    return buckets
-
-
-def _cache_records(
-    *,
-    rows: list[_TrainingRow],
-    latent_paths: list[Path],
-    encoder_hidden_state_paths: list[Path],
-) -> list[_CacheRecord]:
-    if len(rows) != len(latent_paths):
-        raise LorakitError("Latent cache length does not match prepared manifest length")
-    if len(rows) != len(encoder_hidden_state_paths):
-        raise LorakitError("Text embedding cache length does not match prepared manifest length")
-
-    records: list[_CacheRecord] = []
-    for row, latent_path, hidden_path in zip(
-        rows, latent_paths, encoder_hidden_state_paths, strict=True
-    ):
-        latent = _load_tensor(latent_path)
-        hidden = _load_tensor(hidden_path)
-        records.append(
-            _CacheRecord(
-                image=row.image,
-                caption_sha256=_text_sha256(row.caption),
-                image_sha256=row.image_sha256,
-                latent_path=latent_path,
-                encoder_hidden_state_path=hidden_path,
-                latent_shape=tuple(latent.shape),
-                encoder_hidden_state_shape=tuple(hidden.shape),
-            )
-        )
-    _assert_cache_records_are_consistent(records)
-    return records
-
-
-def _write_cache_manifest(path: Path, records: list[_CacheRecord], *, latent_scaling_factor: float) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "version": 1,
-        "count": len(records),
-        "vae_latent_cache": {
-            "mode": LATENT_CACHE_MODE,
-            "scaling_factor": float(latent_scaling_factor),
-        },
-        "latent_shapes": [list(shape) for shape in sorted({record.latent_shape for record in records})],
-        "encoder_hidden_state_shape": list(records[0].encoder_hidden_state_shape),
-        "records": [
-            {
-                "image": record.image,
-                "image_sha256": record.image_sha256,
-                "caption_sha256": record.caption_sha256,
-                "latent_shape": list(record.latent_shape),
-                "latent": str(record.latent_path.relative_to(path.parent)),
-                "encoder_hidden_state": str(record.encoder_hidden_state_path.relative_to(path.parent)),
-            }
-            for record in records
-        ],
-    }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-
-
-def _assert_cache_records_are_consistent(records: list[_CacheRecord]) -> None:
-    if not records:
-        raise LorakitError("Tensor cache has no records")
-    first = records[0]
-    for record in records:
-        if not record.latent_path.exists():
-            raise LorakitError(f"Missing latent cache tensor: {record.latent_path}")
-        if not record.encoder_hidden_state_path.exists():
-            raise LorakitError(f"Missing text cache tensor: {record.encoder_hidden_state_path}")
-        if record.encoder_hidden_state_shape != first.encoder_hidden_state_shape:
-            raise LorakitError(
-                "Text cache tensor shape mismatch: "
-                f"expected {first.encoder_hidden_state_shape}, "
-                f"got {record.encoder_hidden_state_shape} for {record.image}"
-            )
-
-
-def _save_tensor(path: Path, tensor: torch.Tensor) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(tensor, path)
-
-
-def _load_tensor(path: Path, expected_shape: tuple[int, ...] | None = None) -> torch.Tensor:
-    tensor = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(tensor, torch.Tensor):
-        raise LorakitError(f"Cached tensor is not a torch.Tensor: {path}")
-    if expected_shape is not None and tuple(tensor.shape) != expected_shape:
-        raise LorakitError(
-            f"Cached tensor shape changed for {path}: expected {expected_shape}, got {tuple(tensor.shape)}"
-        )
-    return tensor
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(HASH_CHUNK_SIZE_BYTES)
-            if chunk == b"":
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _text_sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _collate_cached(examples: list[dict[str, object]]) -> dict[str, object]:
-    latents = [example["latents"] for example in examples]
-    encoder_hidden_states = [example["encoder_hidden_states"] for example in examples]
-    if not all(isinstance(value, torch.Tensor) for value in latents):
-        raise LorakitError("Cached latent batch contains non-tensor values")
-    if not all(isinstance(value, torch.Tensor) for value in encoder_hidden_states):
-        raise LorakitError("Cached text embedding batch contains non-tensor values")
-    return {
-        "latents": torch.stack(latents).to(memory_format=torch.contiguous_format),
-        "encoder_hidden_states": torch.stack(encoder_hidden_states).to(memory_format=torch.contiguous_format),
-        "record_indices": [int(example["record_index"]) for example in examples],
-        "images": [str(example["image"]) for example in examples],
-        "latent_shape": list(latents[0].shape),
-        "encoder_hidden_state_shape": list(encoder_hidden_states[0].shape),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1047,8 +623,6 @@ def _collate_cached(examples: list[dict[str, object]]) -> dict[str, object]:
 
 
 def _optimizer(parameters_or_unet, learning_rate: float):
-    import bitsandbytes as bnb
-
     if isinstance(parameters_or_unet, torch.nn.Module):
         groups = _lora_plus_optimizer_groups(
             parameters_or_unet,
@@ -1056,11 +630,27 @@ def _optimizer(parameters_or_unet, learning_rate: float):
             ratio=1.0,
         )
         if not groups:
-            groups = [{"params": [p for p in parameters_or_unet.parameters() if p.requires_grad], "lr": learning_rate, "lorakit_group": "default"}]
+            groups = [
+                {
+                    "params": [
+                        parameter
+                        for parameter in parameters_or_unet.parameters()
+                        if parameter.requires_grad
+                    ],
+                    "lr": learning_rate,
+                    "lorakit_group": "default",
+                }
+            ]
     else:
-        groups = [{"params": list(parameters_or_unet), "lr": learning_rate, "lorakit_group": "default"}]
+        groups = [
+            {
+                "params": list(parameters_or_unet),
+                "lr": learning_rate,
+                "lorakit_group": "default",
+            }
+        ]
 
-    return bnb.optim.AdamW8bit(
+    return AdamW8bit(
         groups,
         betas=(0.9, 0.999),
         weight_decay=0.01,
@@ -1115,14 +705,40 @@ def _add_lora_named_parameters_to_optimizer(
 ) -> None:
     a_params = [p for name, p in named_parameters if "lora_A" in name and p.requires_grad]
     b_params = [p for name, p in named_parameters if "lora_B" in name and p.requires_grad]
-    other_params = [p for name, p in named_parameters if "lora_A" not in name and "lora_B" not in name and p.requires_grad]
+    other_params = [
+        parameter
+        for name, parameter in named_parameters
+        if "lora_A" not in name
+        and "lora_B" not in name
+        and parameter.requires_grad
+    ]
     if a_params:
-        optimizer.add_param_group({"params": a_params, "lr": float(base_learning_rate), "initial_lr": float(base_learning_rate), "lorakit_group": "lora_A"})
+        optimizer.add_param_group(
+            {
+                "params": a_params,
+                "lr": float(base_learning_rate),
+                "initial_lr": float(base_learning_rate),
+                "lorakit_group": "lora_A",
+            }
+        )
     if b_params:
-        optimizer.add_param_group({"params": b_params, "lr": float(base_learning_rate) * float(ratio), "initial_lr": float(base_learning_rate) * float(ratio), "lorakit_group": "lora_B"})
+        optimizer.add_param_group(
+            {
+                "params": b_params,
+                "lr": float(base_learning_rate) * float(ratio),
+                "initial_lr": float(base_learning_rate) * float(ratio),
+                "lorakit_group": "lora_B",
+            }
+        )
     if other_params:
-        optimizer.add_param_group({"params": other_params, "lr": float(base_learning_rate), "initial_lr": float(base_learning_rate), "lorakit_group": "default"})
-
+        optimizer.add_param_group(
+            {
+                "params": other_params,
+                "lr": float(base_learning_rate),
+                "initial_lr": float(base_learning_rate),
+                "lorakit_group": "default",
+            }
+        )
 
 
 def _sync_scheduler_param_groups_after_optimizer_growth(
@@ -1133,37 +749,99 @@ def _sync_scheduler_param_groups_after_optimizer_growth(
 ) -> None:
     """Keep torch/accelerate schedulers consistent after dynamic optimizer growth.
 
-    PyTorch LR schedulers keep one base LR per optimizer parameter group.  Dynamic
-    rank growth adds optimizer groups after scheduler creation, so the scheduler
-    must receive matching base_lrs entries before its next step().
+    PyTorch LR schedulers keep one base LR and, for LambdaLR, one lambda function
+    per optimizer parameter group. Dynamic rank growth adds optimizer groups after
+    scheduler creation, so the scheduler must receive matching entries before its
+    next step().
+
+    Raises:
+        LorakitError: If optimizer or scheduler state is internally inconsistent.
     """
     groups_after = len(optimizer.param_groups)
     if groups_after <= groups_before:
         return
 
     wrapped_scheduler = getattr(scheduler, "scheduler", scheduler)
-    new_base_lrs = [
-        float(group.get("initial_lr", group.get("lr", 0.0)))
-        for group in optimizer.param_groups[groups_before:]
-    ]
+    _validate_scheduler_group_count(
+        scheduler=wrapped_scheduler,
+        optimizer=optimizer,
+        groups_before=groups_before,
+    )
+
+    new_groups = optimizer.param_groups[groups_before:]
+    new_base_lrs = [_learning_rate_for_scheduler_group(group) for group in new_groups]
 
     if hasattr(wrapped_scheduler, "base_lrs"):
         wrapped_scheduler.base_lrs.extend(new_base_lrs)
 
+    if hasattr(wrapped_scheduler, "lr_lambdas"):
+        _extend_scheduler_lambdas(
+            scheduler=wrapped_scheduler,
+            groups_before=groups_before,
+            groups_after=groups_after,
+        )
+
     if hasattr(wrapped_scheduler, "_last_lr"):
-        last_lr = list(getattr(wrapped_scheduler, "_last_lr", []))
-        last_lr.extend(float(group.get("lr", base_lr)) for group, base_lr in zip(
-            optimizer.param_groups[groups_before:],
-            new_base_lrs,
-            strict=True,
-        ))
+        last_lr = list(getattr(wrapped_scheduler, "_last_lr"))
+        last_lr.extend(_current_learning_rate_for_scheduler_group(group) for group in new_groups)
         wrapped_scheduler._last_lr = last_lr
 
-    # Some schedulers also track per-group initial_lr.  PyTorch normally sets
-    # this when a scheduler is created, but dynamically added groups need it too.
-    for group in optimizer.param_groups[groups_before:]:
-        group.setdefault("initial_lr", float(group.get("lr", 0.0)))
 
+def _validate_scheduler_group_count(
+    *,
+    scheduler,
+    optimizer,
+    groups_before: int,
+) -> None:
+    base_lrs = getattr(scheduler, "base_lrs", None)
+    if base_lrs is not None and len(base_lrs) != groups_before:
+        raise LorakitError(
+            "Scheduler base learning-rate count does not match optimizer groups "
+            f"before rank growth: scheduler={len(base_lrs)}, optimizer_before={groups_before}, "
+            f"optimizer_after={len(optimizer.param_groups)}"
+        )
+
+    lr_lambdas = getattr(scheduler, "lr_lambdas", None)
+    if lr_lambdas is not None and len(lr_lambdas) != groups_before:
+        raise LorakitError(
+            "Scheduler lambda count does not match optimizer groups before rank growth: "
+            f"scheduler={len(lr_lambdas)}, optimizer_before={groups_before}, "
+            f"optimizer_after={len(optimizer.param_groups)}"
+        )
+
+
+def _learning_rate_for_scheduler_group(group: dict[str, object]) -> float:
+    if "initial_lr" not in group:
+        raise LorakitError("New optimizer parameter group is missing required initial_lr")
+    return _float_optimizer_group_value(group=group, key="initial_lr")
+
+
+def _current_learning_rate_for_scheduler_group(group: dict[str, object]) -> float:
+    if "lr" not in group:
+        raise LorakitError("New optimizer parameter group is missing required lr")
+    return _float_optimizer_group_value(group=group, key="lr")
+
+
+def _float_optimizer_group_value(*, group: dict[str, object], key: str) -> float:
+    value = group[key]
+    if not isinstance(value, int | float):
+        raise LorakitError(f"Optimizer parameter group {key} must be numeric, got {type(value).__name__}")
+    return float(value)
+
+
+def _extend_scheduler_lambdas(
+    *,
+    scheduler,
+    groups_before: int,
+    groups_after: int,
+) -> None:
+    if groups_before == 0:
+        raise LorakitError("Cannot extend scheduler lambdas without existing optimizer groups")
+
+    lr_lambdas = list(scheduler.lr_lambdas)
+    lambda_template = lr_lambdas[-1]
+    lr_lambdas.extend(lambda_template for _ in range(groups_after - groups_before))
+    scheduler.lr_lambdas = lr_lambdas
 
 
 def _batch_tensor(batch: dict[str, object], key: str) -> torch.Tensor:
@@ -1300,87 +978,6 @@ def _target(
 # ---------------------------------------------------------------------------
 
 
-def _split_train_validation_records(records: list[_CacheRecord]) -> tuple[list[_CacheRecord], list[_CacheRecord]]:
-    if len(records) < 2:
-        return records, []
-    validation_count = min(
-        VALIDATION_MAX_ITEMS,
-        max(1, int(round(len(records) * VALIDATION_FRACTION))),
-    )
-    validation_candidates = sorted(records, key=_validation_split_key)[:validation_count]
-    validation_hashes = {record.image_sha256 for record in validation_candidates}
-    train_records = [record for record in records if record.image_sha256 not in validation_hashes]
-    validation_records = [record for record in records if record.image_sha256 in validation_hashes]
-    if not train_records:
-        return records, []
-    return train_records, validation_records
-
-
-def _validation_split_key(record: _CacheRecord) -> str:
-    return hashlib.sha256(f"lorakit-validation-v1:{record.image_sha256}".encode("utf-8")).hexdigest()
-
-
-def _build_validation_skeleton(
-    *,
-    records: list[_CacheRecord],
-    noise_scheduler: DDPMScheduler,
-) -> _ValidationSkeleton:
-    if not records:
-        return _ValidationSkeleton(items=())
-    bucket_timesteps = _validation_bucket_timesteps(
-        total_timesteps=int(noise_scheduler.config.num_train_timesteps)
-    )
-    timesteps = [timestep for _record in records for timestep in bucket_timesteps.values()]
-    snr_values = _snr_for_timesteps(
-        noise_scheduler=noise_scheduler,
-        timesteps=torch.tensor(timesteps, dtype=torch.long),
-    ).detach().float().cpu()
-    bucket_names = [bucket for _record in records for bucket in bucket_timesteps]
-    repeated_records = [record for record in records for _bucket in bucket_timesteps]
-    items = tuple(
-        _ValidationItem(
-            record=record,
-            timestep=int(timestep),
-            noise_seed=_validation_noise_seed(record=record, snr_bucket=bucket),
-            snr=float(snr),
-            snr_bucket=bucket,
-        )
-        for record, timestep, bucket, snr in zip(
-            repeated_records,
-            timesteps,
-            bucket_names,
-            snr_values.tolist(),
-            strict=True,
-        )
-    )
-    return _ValidationSkeleton(items=items)
-
-
-def _validation_bucket_timesteps(*, total_timesteps: int) -> dict[str, int]:
-    if total_timesteps <= 0:
-        raise LorakitError("Noise scheduler must expose at least one timestep")
-    return {
-        "high": _validation_timestep_at_fraction(fraction=0.10, total_timesteps=total_timesteps),
-        "mid": _validation_timestep_at_fraction(fraction=0.50, total_timesteps=total_timesteps),
-        "low": _validation_timestep_at_fraction(fraction=0.90, total_timesteps=total_timesteps),
-    }
-
-
-def _validation_timestep_at_fraction(*, fraction: float, total_timesteps: int) -> int:
-    if total_timesteps <= 0:
-        raise LorakitError("Noise scheduler must expose at least one timestep")
-    if fraction < 0.0 or fraction > 1.0:
-        raise LorakitError(f"Validation timestep fraction must be within [0, 1]: {fraction}")
-    return min(total_timesteps - 1, max(0, int(round(float(total_timesteps - 1) * fraction))))
-
-
-def _validation_noise_seed(*, record: _CacheRecord, snr_bucket: str) -> int:
-    digest = hashlib.sha256(
-        f"lorakit-validation-noise-v1:{record.image_sha256}:{snr_bucket}".encode("utf-8")
-    ).hexdigest()
-    return int(digest[:16], 16) % (2**31)
-
-
 def _evaluate_validation_skeleton(
     *,
     skeleton: _ValidationSkeleton,
@@ -1389,29 +986,15 @@ def _evaluate_validation_skeleton(
     weight_dtype: torch.dtype,
     step: int,
 ) -> _ValidationReport:
-    if not skeleton.items:
-        raise LorakitError("Validation skeleton has no items")
-    losses_by_bucket: dict[str, list[float]] = {}
-    with torch.no_grad():
-        for item in skeleton.items:
-            loss = _validation_item_loss(
-                item=item,
-                unet=unet,
-                noise_scheduler=noise_scheduler,
-                weight_dtype=weight_dtype,
-            )
-            losses_by_bucket.setdefault(item.snr_bucket, []).append(loss)
-    bucket_means = {
-        bucket: float(sum(losses) / len(losses))
-        for bucket, losses in losses_by_bucket.items()
-    }
-    all_losses = [loss for losses in losses_by_bucket.values() for loss in losses]
-    return _ValidationReport(
-        step=int(step),
-        loss_mean=float(sum(all_losses) / len(all_losses)),
-        loss_max_snr_bucket=float(max(bucket_means.values())),
-        loss_by_snr_bucket=bucket_means,
-        item_count=len(all_losses),
+    return _evaluate_validation_skeleton_from_items(
+        skeleton=skeleton,
+        step=step,
+        loss_for_item=lambda item: _validation_item_loss(
+            item=item,
+            unet=unet,
+            noise_scheduler=noise_scheduler,
+            weight_dtype=weight_dtype,
+        ),
     )
 
 
@@ -1460,95 +1043,6 @@ def _validation_item_loss_tensor(
         noise=noise.unsqueeze(0),
         timesteps=torch.tensor([item.timestep], dtype=torch.long),
     )
-
-
-def _select_best_checkpoint(*, current: _BestCheckpoint, report: _ValidationReport) -> tuple[bool, _BestCheckpoint]:
-    if current.loss_max_snr_bucket is None or current.loss_mean is None or current.step is None:
-        return True, _BestCheckpoint(
-            path=current.path,
-            step=report.step,
-            loss_max_snr_bucket=report.loss_max_snr_bucket,
-            loss_mean=report.loss_mean,
-        )
-    candidate_key = (report.loss_max_snr_bucket, report.loss_mean, report.step)
-    current_key = (current.loss_max_snr_bucket, current.loss_mean, current.step)
-    if candidate_key < current_key:
-        return True, _BestCheckpoint(
-            path=current.path,
-            step=report.step,
-            loss_max_snr_bucket=report.loss_max_snr_bucket,
-            loss_mean=report.loss_mean,
-        )
-    return False, current
-
-
-def _validation_score_tolerance(report: _ValidationReport) -> float:
-    return max(
-        VALIDATION_SCORE_ABSOLUTE_TOLERANCE,
-        VALIDATION_SCORE_RELATIVE_TOLERANCE * max(report.loss_by_snr_bucket.values()),
-    )
-
-
-def _validation_score_improves(*, baseline: _ValidationReport, candidate: _ValidationReport) -> bool:
-    tolerance = _validation_score_tolerance(baseline)
-    if candidate.loss_max_snr_bucket < baseline.loss_max_snr_bucket - tolerance:
-        return True
-    if candidate.loss_max_snr_bucket > baseline.loss_max_snr_bucket + tolerance:
-        return False
-    return candidate.loss_mean < baseline.loss_mean - tolerance
-
-
-def _validation_score_nonworse(*, baseline: _ValidationReport, candidate: _ValidationReport) -> bool:
-    tolerance = _validation_score_tolerance(baseline)
-    if candidate.loss_max_snr_bucket > baseline.loss_max_snr_bucket + tolerance:
-        return False
-    if candidate.loss_mean > baseline.loss_mean + tolerance:
-        return False
-    return True
-
-
-def _validation_delta_log(
-    *,
-    baseline: _ValidationReport,
-    candidate: _ValidationReport,
-    gamma: float | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "validation_loss_max_snr_bucket_delta": float(candidate.loss_max_snr_bucket - baseline.loss_max_snr_bucket),
-        "validation_loss_mean_delta": float(candidate.loss_mean - baseline.loss_mean),
-    }
-    if gamma is not None:
-        payload["gamma"] = float(gamma)
-    return payload
-
-
-def _write_validation_report_if_main(
-    *,
-    probe_log_path: Path,
-    report: _ValidationReport,
-    best_checkpoint: _BestCheckpoint,
-    improved: bool,
-    should_log: bool,
-) -> None:
-    if not should_log:
-        return
-    payload = {
-        "step": int(report.step),
-        "probe_status": "validation",
-        "validation_loss_mean": float(report.loss_mean),
-        "validation_loss_max_snr_bucket": float(report.loss_max_snr_bucket),
-        "validation_loss_by_snr_bucket": {
-            bucket: float(loss)
-            for bucket, loss in sorted(report.loss_by_snr_bucket.items())
-        },
-        "validation_item_count": int(report.item_count),
-        "best_checkpoint_improved": bool(improved),
-        "best_checkpoint_step": best_checkpoint.step,
-        "best_checkpoint_path": str(best_checkpoint.path),
-    }
-    with probe_log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True))
-        handle.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -3003,13 +2497,6 @@ def _cuda_memory_snapshot() -> dict[str, int] | None:
         "max_allocated_cuda_bytes": int(torch.cuda.max_memory_allocated()),
         "max_reserved_cuda_bytes": int(torch.cuda.max_memory_reserved()),
     }
-
-
-def _snr_for_timesteps(*, noise_scheduler: DDPMScheduler, timesteps: torch.Tensor) -> torch.Tensor:
-    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=timesteps.device, dtype=torch.float32)
-    alpha = torch.sqrt(alphas_cumprod[timesteps])
-    sigma = torch.sqrt(1.0 - alphas_cumprod[timesteps]).clamp_min(1e-12)
-    return (alpha / sigma) ** 2
 
 
 def _jsonable_int_list(value: object) -> list[int]:
