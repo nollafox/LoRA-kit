@@ -1034,6 +1034,50 @@ def test_move_module_to_device_handles_meta_tensors(tmp_path):
     assert moved.param.dtype == torch.float32
 
 
+def test_diffusers_load_rows_rejects_mixed_image_shapes(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    prepared_dir = tmp_path / "prepared"
+    _image(prepared_dir / "images" / "a.png", size=(32, 32))
+    _image(prepared_dir / "images" / "b.png", size=(64, 32))
+    _write_prepared_manifest(
+        prepared_dir,
+        [
+            {"image": "images/a.png", "caption": "a", "tags": ["tag"]},
+            {"image": "images/b.png", "caption": "b", "tags": ["tag"]},
+        ],
+    )
+
+    with pytest.raises(LorakitError, match="must share one tensor shape"):
+        diffusers_backend._load_rows(prepared_dir)
+
+
+def test_diffusers_disk_cache_dataset_validates_and_loads_tensors(tmp_path):
+    from lorakit.training.backends import diffusers as diffusers_backend
+
+    latent_path = tmp_path / "latents" / "00000000.pt"
+    hidden_path = tmp_path / "text" / "00000000.pt"
+    latent_path.parent.mkdir(parents=True)
+    hidden_path.parent.mkdir(parents=True)
+    torch.save(torch.zeros(4, 8, 8), latent_path)
+    torch.save(torch.zeros(77, 768), hidden_path)
+    record = diffusers_backend._CacheRecord(
+        image="images/a.png",
+        caption_sha256="caption",
+        image_sha256="image",
+        latent_path=latent_path,
+        encoder_hidden_state_path=hidden_path,
+        latent_shape=(4, 8, 8),
+        encoder_hidden_state_shape=(77, 768),
+    )
+
+    dataset = diffusers_backend._DiskCachedLatentDataset(records=[record])
+
+    item = dataset[0]
+    assert tuple(item["latents"].shape) == (4, 8, 8)
+    assert tuple(item["encoder_hidden_states"].shape) == (77, 768)
+
+
 def test_models_remove_rejects_non_local_repo_id(tmp_path):
     project = Project(tmp_path / "data")
 
@@ -1730,6 +1774,12 @@ def _metadata(path: Path, *, tags: list[str] | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"tags": tags if tags is not None else ["tag"], "metadata": {"source": "test"}}
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_prepared_manifest(prepared_dir: Path, rows: list[dict[str, object]]) -> None:
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(json.dumps(row) for row in rows)
+    (prepared_dir / MANIFEST_NAME).write_text(f"{content}\n", encoding="utf-8")
 
 
 def _six2one_metadata(
