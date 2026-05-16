@@ -12,7 +12,7 @@ from diffusers.utils import convert_state_dict_to_diffusers
 from peft.utils import get_peft_model_state_dict
 
 from lorakit.errors import LorakitError
-from lorakit.training.backends._loss import batch_tensor
+from lorakit.training.backends._cache import CachedBatch
 from lorakit.training.backends._validation import snr_for_timesteps
 
 
@@ -21,7 +21,7 @@ LORA_WEIGHTS_NAME = "pytorch_lora_weights.safetensors"
 
 def probe_extra_metadata(
     *,
-    batch: dict[str, object],
+    batch: CachedBatch,
     probe_batches,
     noise_scheduler: DDPMScheduler,
     timesteps: torch.Tensor,
@@ -32,8 +32,8 @@ def probe_extra_metadata(
     probe_version: int,
     cuda_memory_snapshot,
 ) -> dict[str, object]:
-    latents = batch_tensor(batch, "latents")
-    encoder_hidden_states = batch_tensor(batch, "encoder_hidden_states")
+    latents = batch.latents
+    encoder_hidden_states = batch.encoder_hidden_states
     detached_timesteps = timesteps.detach().cpu()
     snr = snr_for_timesteps(noise_scheduler=noise_scheduler, timesteps=detached_timesteps.long()).detach().float().cpu()
 
@@ -44,14 +44,14 @@ def probe_extra_metadata(
     window_sources: list[str] = []
     window_latent_item_shapes: list[list[int]] = []
     for probe_batch in probe_batches:
-        probe_latents = batch_tensor(probe_batch.batch, "latents")
+        probe_latents = probe_batch.batch.latents
         probe_timesteps = probe_batch.timesteps.detach().cpu().long()
         probe_snr = snr_for_timesteps(noise_scheduler=noise_scheduler, timesteps=probe_timesteps).detach().float().cpu()
         batch_size = int(probe_latents.shape[0])
         window_timesteps.extend(int(item) for item in probe_timesteps.tolist())
         window_snr_values.extend(float(item) for item in probe_snr.tolist())
-        window_record_indices.extend(jsonable_int_list(probe_batch.batch.get("record_indices")))
-        window_images.extend(jsonable_str_list(probe_batch.batch.get("images")))
+        window_record_indices.extend(jsonable_int_list(probe_batch.batch.record_indices))
+        window_images.extend(jsonable_str_list(probe_batch.batch.images))
         window_sources.extend([probe_batch.source] * batch_size)
         window_latent_item_shapes.extend([[int(item) for item in probe_latents.shape[1:]]] * batch_size)
 
@@ -65,8 +65,8 @@ def probe_extra_metadata(
         "latent_item_shape": [int(item) for item in latents.shape[1:]],
         "encoder_hidden_state_batch_shape": [int(item) for item in encoder_hidden_states.shape],
         "encoder_hidden_state_item_shape": [int(item) for item in encoder_hidden_states.shape[1:]],
-        "record_indices": jsonable_int_list(batch.get("record_indices")),
-        "images": jsonable_str_list(batch.get("images")),
+        "record_indices": jsonable_int_list(batch.record_indices),
+        "images": jsonable_str_list(batch.images),
         "timesteps": [int(item) for item in detached_timesteps.tolist()],
         "snr": [float(item) for item in snr.tolist()],
         "snr_min": float(snr.min().item()),
@@ -183,12 +183,12 @@ def save_named_lora_weights(*, unet: torch.nn.Module, output_dir: Path, filename
 def jsonable_int_list(value: object) -> list[int]:
     if isinstance(value, torch.Tensor):
         return [int(item) for item in value.detach().cpu().reshape(-1).tolist()]
-    if isinstance(value, list):
+    if isinstance(value, list | tuple):
         return [int(item) for item in value]
     return []
 
 
 def jsonable_str_list(value: object) -> list[str]:
-    if isinstance(value, list):
+    if isinstance(value, list | tuple):
         return [str(item) for item in value]
     return []

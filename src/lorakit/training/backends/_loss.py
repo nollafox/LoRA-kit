@@ -8,6 +8,7 @@ import torch
 from diffusers import DDPMScheduler, UNet2DConditionModel
 
 from lorakit.errors import LorakitError
+from lorakit.training.backends._cache import CachedBatch
 from lorakit.training.backends._policy import ObjectiveKind, ObjectivePolicy, snr_loss_weights
 from lorakit.training.certified_stepper import denoising_loss_per_example
 
@@ -19,22 +20,15 @@ class LossContext:
     timesteps: torch.Tensor
 
 
-def batch_tensor(batch: dict[str, object], key: str) -> torch.Tensor:
-    value = batch[key]
-    if not isinstance(value, torch.Tensor):
-        raise LorakitError(f"Batch value must be a tensor: {key}")
-    return value
-
-
 def loss_context(
     *,
-    batch: dict[str, object],
+    batch: CachedBatch,
     unet: UNet2DConditionModel,
     noise_scheduler: DDPMScheduler,
     weight_dtype: torch.dtype,
     objective: ObjectivePolicy,
 ) -> LossContext:
-    latents = batch_tensor(batch, "latents").to(device=unet.device, dtype=weight_dtype)
+    latents = batch.latents.to(device=unet.device, dtype=weight_dtype)
     noise = torch.randn_like(latents)
     timesteps = torch.randint(
         0,
@@ -55,7 +49,7 @@ def loss_context(
 
 def loss_context_fixed(
     *,
-    batch: dict[str, object],
+    batch: CachedBatch,
     unet: UNet2DConditionModel,
     noise_scheduler: DDPMScheduler,
     weight_dtype: torch.dtype,
@@ -63,8 +57,8 @@ def loss_context_fixed(
     noise: torch.Tensor,
     timesteps: torch.Tensor,
 ) -> LossContext:
-    latents = batch_tensor(batch, "latents").to(device=unet.device, dtype=weight_dtype)
-    encoder_hidden_states = batch_tensor(batch, "encoder_hidden_states").to(device=unet.device, dtype=weight_dtype)
+    latents = batch.latents.to(device=unet.device, dtype=weight_dtype)
+    encoder_hidden_states = batch.encoder_hidden_states.to(device=unet.device, dtype=weight_dtype)
     local_noise = noise.to(device=unet.device, dtype=weight_dtype)
     local_timesteps = timesteps.to(device=unet.device).long()
     noisy_latents = noise_scheduler.add_noise(latents, local_noise, local_timesteps)
@@ -123,7 +117,7 @@ def target(
 
 def fixed_subset_context_loss(
     *,
-    batch: dict[str, object],
+    batch: CachedBatch,
     mask: torch.Tensor,
     unet: UNet2DConditionModel,
     noise_scheduler: DDPMScheduler,
@@ -131,8 +125,8 @@ def fixed_subset_context_loss(
     noise: torch.Tensor,
     timesteps: torch.Tensor,
 ) -> torch.Tensor:
-    latents = batch_tensor(batch, "latents").to(device=unet.device, dtype=weight_dtype)[mask]
-    encoder_hidden_states = batch_tensor(batch, "encoder_hidden_states").to(device=unet.device, dtype=weight_dtype)[mask]
+    latents = batch.latents.to(device=unet.device, dtype=weight_dtype)[mask]
+    encoder_hidden_states = batch.encoder_hidden_states.to(device=unet.device, dtype=weight_dtype)[mask]
     local_noise = noise.to(device=unet.device, dtype=weight_dtype)[mask]
     local_timesteps = timesteps.to(device=unet.device).long()[mask]
     noisy_latents = noise_scheduler.add_noise(latents, local_noise, local_timesteps)

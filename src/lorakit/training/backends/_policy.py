@@ -10,6 +10,7 @@ from diffusers import DDPMScheduler
 
 from lorakit.errors import LorakitError
 from lorakit.training.backends._validation import (
+    SnrBucket,
     ValidationReport,
     ValidationSkeleton,
     snr_for_timesteps,
@@ -25,6 +26,15 @@ class ObjectiveKind(StrEnum):
 class ObjectivePolicy:
     kind: ObjectiveKind
     gamma: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind == ObjectiveKind.BASE_MSE and self.gamma is not None:
+            raise LorakitError("Base MSE objective must not set gamma")
+        if self.kind == ObjectiveKind.MIN_SNR:
+            if self.gamma is None:
+                raise LorakitError("Min-SNR objective requires gamma")
+            if self.gamma <= 0.0:
+                raise LorakitError(f"Min-SNR gamma must be positive: {self.gamma}")
 
     @classmethod
     def base_mse(cls) -> "ObjectivePolicy":
@@ -54,6 +64,10 @@ class TrainingPolicy:
     objective: ObjectivePolicy
     lora_plus_ratio: float
 
+    def __post_init__(self) -> None:
+        if self.lora_plus_ratio <= 0.0:
+            raise LorakitError(f"LoRA+ ratio must be positive: {self.lora_plus_ratio}")
+
     @classmethod
     def default(cls) -> "TrainingPolicy":
         return cls(objective=ObjectivePolicy.base_mse(), lora_plus_ratio=1.0)
@@ -72,7 +86,7 @@ def objective_candidates(
 ) -> list[ObjectivePolicy]:
     candidates = [ObjectivePolicy.base_mse()]
     gammas = [
-        validation_bucket_gamma(validation_skeleton=validation_skeleton, bucket="mid"),
+        validation_bucket_gamma(validation_skeleton=validation_skeleton, bucket=SnrBucket.MID),
         5.0,
         validation_bucket_gamma(
             validation_skeleton=validation_skeleton,
@@ -91,10 +105,10 @@ def objective_candidates(
     return candidates
 
 
-def validation_bucket_gamma(*, validation_skeleton: ValidationSkeleton, bucket: str) -> float:
+def validation_bucket_gamma(*, validation_skeleton: ValidationSkeleton, bucket: SnrBucket) -> float:
     values = [item.snr for item in validation_skeleton.items if item.snr_bucket == bucket]
     if not values:
-        raise LorakitError(f"Validation skeleton has no SNR bucket: {bucket}")
+        raise LorakitError(f"Validation skeleton has no SNR bucket: {bucket.value}")
     return float(sum(values) / len(values))
 
 

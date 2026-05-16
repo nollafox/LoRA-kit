@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Final
 
@@ -28,13 +29,26 @@ VALIDATION_SEED_HEX_LENGTH: Final = 16
 VALIDATION_SEED_MODULUS: Final = 2**31
 
 
+class SnrBucket(StrEnum):
+    HIGH = "high"
+    MID = "mid"
+    LOW = "low"
+
+
+VALIDATION_BUCKET_FRACTIONS: Final[dict[SnrBucket, float]] = {
+    SnrBucket.HIGH: VALIDATION_HIGH_SNR_FRACTION,
+    SnrBucket.MID: VALIDATION_MID_SNR_FRACTION,
+    SnrBucket.LOW: VALIDATION_LOW_SNR_FRACTION,
+}
+
+
 @dataclass(frozen=True)
 class ValidationItem:
     record: CacheRecord
     timestep: int
     noise_seed: int
     snr: float
-    snr_bucket: str
+    snr_bucket: SnrBucket
 
 
 @dataclass(frozen=True)
@@ -47,7 +61,7 @@ class ValidationReport:
     step: int
     loss_mean: float
     loss_max_snr_bucket: float
-    loss_by_snr_bucket: dict[str, float]
+    loss_by_snr_bucket: dict[SnrBucket, float]
     item_count: int
 
     @property
@@ -58,7 +72,7 @@ class ValidationReport:
         )
 
     @property
-    def worst_bucket(self) -> str:
+    def worst_bucket(self) -> SnrBucket:
         return max(self.loss_by_snr_bucket, key=self.loss_by_snr_bucket.get)
 
     def improves(self, baseline: "ValidationReport") -> bool:
@@ -95,8 +109,11 @@ class ValidationReport:
             "validation_loss_mean": float(self.loss_mean),
             "validation_loss_max_snr_bucket": float(self.loss_max_snr_bucket),
             "validation_loss_by_snr_bucket": {
-                bucket: float(loss)
-                for bucket, loss in sorted(self.loss_by_snr_bucket.items())
+                bucket.value: float(loss)
+                for bucket, loss in sorted(
+                    self.loss_by_snr_bucket.items(),
+                    key=lambda item: item[0].value,
+                )
             },
             "validation_item_count": int(self.item_count),
             "best_checkpoint_improved": bool(improved),
@@ -196,22 +213,15 @@ def build_validation_skeleton(
     return ValidationSkeleton(items=items)
 
 
-def validation_bucket_timesteps(*, total_timesteps: int) -> dict[str, int]:
+def validation_bucket_timesteps(*, total_timesteps: int) -> dict[SnrBucket, int]:
     if total_timesteps <= 0:
         raise LorakitError("Noise scheduler must expose at least one timestep")
     return {
-        "high": validation_timestep_at_fraction(
-            fraction=VALIDATION_HIGH_SNR_FRACTION,
+        bucket: validation_timestep_at_fraction(
+            fraction=fraction,
             total_timesteps=total_timesteps,
-        ),
-        "mid": validation_timestep_at_fraction(
-            fraction=VALIDATION_MID_SNR_FRACTION,
-            total_timesteps=total_timesteps,
-        ),
-        "low": validation_timestep_at_fraction(
-            fraction=VALIDATION_LOW_SNR_FRACTION,
-            total_timesteps=total_timesteps,
-        ),
+        )
+        for bucket, fraction in VALIDATION_BUCKET_FRACTIONS.items()
     }
 
 
@@ -223,9 +233,9 @@ def validation_timestep_at_fraction(*, fraction: float, total_timesteps: int) ->
     return min(total_timesteps - 1, max(0, int(round(float(total_timesteps - 1) * fraction))))
 
 
-def validation_noise_seed(*, record: CacheRecord, snr_bucket: str) -> int:
+def validation_noise_seed(*, record: CacheRecord, snr_bucket: SnrBucket) -> int:
     digest = hashlib.sha256(
-        f"{VALIDATION_NOISE_NAMESPACE}:{record.image_sha256}:{snr_bucket}".encode("utf-8")
+        f"{VALIDATION_NOISE_NAMESPACE}:{record.image_sha256}:{snr_bucket.value}".encode("utf-8")
     ).hexdigest()
     return int(digest[:VALIDATION_SEED_HEX_LENGTH], 16) % VALIDATION_SEED_MODULUS
 
@@ -238,7 +248,7 @@ def evaluate_validation_skeleton(
 ) -> ValidationReport:
     if not skeleton.items:
         raise LorakitError("Validation skeleton has no items")
-    losses_by_bucket: dict[str, list[float]] = {}
+    losses_by_bucket: dict[SnrBucket, list[float]] = {}
     with torch.no_grad():
         for item in skeleton.items:
             loss = loss_for_item(item)

@@ -2,45 +2,51 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from bitsandbytes.optim import AdamW8bit
 
 from lorakit.errors import LorakitError
 
 
-def optimizer(parameters_or_unet, learning_rate: float):
-    if isinstance(parameters_or_unet, torch.nn.Module):
-        groups = lora_plus_optimizer_groups(
-            parameters_or_unet,
-            base_learning_rate=learning_rate,
-            ratio=1.0,
-        )
-        if not groups:
-            groups = [
-                {
-                    "params": [
-                        parameter
-                        for parameter in parameters_or_unet.parameters()
-                        if parameter.requires_grad
-                    ],
-                    "lr": learning_rate,
-                    "lorakit_group": "default",
-                }
-            ]
-    else:
-        groups = [
-            {
-                "params": list(parameters_or_unet),
-                "lr": learning_rate,
-                "lorakit_group": "default",
-            }
-        ]
+@dataclass(frozen=True)
+class OptimizerConfig:
+    learning_rate: float
+    lora_plus_ratio: float = 1.0
+    betas: tuple[float, float] = (0.9, 0.999)
+    weight_decay: float = 0.01
+    eps: float = 1e-8
 
+    def __post_init__(self) -> None:
+        if self.learning_rate <= 0.0:
+            raise LorakitError(f"Learning rate must be positive: {self.learning_rate}")
+        if self.lora_plus_ratio <= 0.0:
+            raise LorakitError(f"LoRA+ ratio must be positive: {self.lora_plus_ratio}")
+        if self.weight_decay < 0.0:
+            raise LorakitError(f"Weight decay must be non-negative: {self.weight_decay}")
+        if self.eps <= 0.0:
+            raise LorakitError(f"Optimizer epsilon must be positive: {self.eps}")
+        if len(self.betas) != 2:
+            raise LorakitError(f"Adam betas must contain exactly two values: {self.betas}")
+        beta1, beta2 = self.betas
+        if not (0.0 <= beta1 < 1.0 and 0.0 <= beta2 < 1.0):
+            raise LorakitError(f"Adam betas must be in [0, 1): {self.betas}")
+
+
+def build_lora_optimizer(unet: torch.nn.Module, config: OptimizerConfig) -> AdamW8bit:
+    groups = lora_plus_optimizer_groups(
+        unet,
+        base_learning_rate=config.learning_rate,
+        ratio=config.lora_plus_ratio,
+    )
+    if not groups:
+        raise LorakitError("No trainable parameters found for optimizer")
     return AdamW8bit(
         groups,
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
-        eps=1e-8,
+        betas=config.betas,
+        weight_decay=config.weight_decay,
+        eps=config.eps,
     )
 
 
@@ -65,12 +71,36 @@ def lora_plus_optimizer_groups(
 
     groups: list[dict[str, object]] = []
     if lora_a:
-        groups.append({"params": lora_a, "lr": float(base_learning_rate), "lorakit_group": "lora_A"})
+        groups.append(
+            optimizer_group(params=lora_a, learning_rate=float(base_learning_rate), group_name="lora_A")
+        )
     if lora_b:
-        groups.append({"params": lora_b, "lr": float(base_learning_rate) * float(ratio), "lorakit_group": "lora_B"})
+        groups.append(
+            optimizer_group(
+                params=lora_b,
+                learning_rate=float(base_learning_rate) * float(ratio),
+                group_name="lora_B",
+            )
+        )
     if other:
-        groups.append({"params": other, "lr": float(base_learning_rate), "lorakit_group": "default"})
+        groups.append(
+            optimizer_group(params=other, learning_rate=float(base_learning_rate), group_name="default")
+        )
     return groups
+
+
+def optimizer_group(
+    *,
+    params: list[torch.nn.Parameter],
+    learning_rate: float,
+    group_name: str,
+) -> dict[str, object]:
+    return {
+        "params": params,
+        "lr": float(learning_rate),
+        "initial_lr": float(learning_rate),
+        "lorakit_group": group_name,
+    }
 
 
 def set_lora_plus_optimizer_ratio(optimizer, *, base_learning_rate: float, ratio: float) -> None:
@@ -100,30 +130,27 @@ def add_lora_named_parameters_to_optimizer(
     ]
     if a_params:
         optimizer.add_param_group(
-            {
-                "params": a_params,
-                "lr": float(base_learning_rate),
-                "initial_lr": float(base_learning_rate),
-                "lorakit_group": "lora_A",
-            }
+            optimizer_group(
+                params=a_params,
+                learning_rate=float(base_learning_rate),
+                group_name="lora_A",
+            )
         )
     if b_params:
         optimizer.add_param_group(
-            {
-                "params": b_params,
-                "lr": float(base_learning_rate) * float(ratio),
-                "initial_lr": float(base_learning_rate) * float(ratio),
-                "lorakit_group": "lora_B",
-            }
+            optimizer_group(
+                params=b_params,
+                learning_rate=float(base_learning_rate) * float(ratio),
+                group_name="lora_B",
+            )
         )
     if other_params:
         optimizer.add_param_group(
-            {
-                "params": other_params,
-                "lr": float(base_learning_rate),
-                "initial_lr": float(base_learning_rate),
-                "lorakit_group": "default",
-            }
+            optimizer_group(
+                params=other_params,
+                learning_rate=float(base_learning_rate),
+                group_name="default",
+            )
         )
 
 

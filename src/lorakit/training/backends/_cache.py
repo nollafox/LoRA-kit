@@ -8,7 +8,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Final
+from typing import Callable, Final, Sequence
 
 import torch
 from diffusers import AutoencoderKL
@@ -52,6 +52,75 @@ class CacheRecord:
     encoder_hidden_state_shape: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class CachedExample:
+    latents: torch.Tensor
+    encoder_hidden_states: torch.Tensor
+    record_index: int
+    image: str
+    latent_shape: tuple[int, ...]
+    encoder_hidden_state_shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CachedBatch:
+    latents: torch.Tensor
+    encoder_hidden_states: torch.Tensor
+    record_indices: tuple[int, ...]
+    images: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.latents, torch.Tensor):
+            raise LorakitError("Cached batch latents must be a torch.Tensor")
+        if not isinstance(self.encoder_hidden_states, torch.Tensor):
+            raise LorakitError("Cached batch text embeddings must be a torch.Tensor")
+        if self.latents.ndim < 1:
+            raise LorakitError("Cached latent batch must include a batch dimension")
+        if self.encoder_hidden_states.ndim < 1:
+            raise LorakitError("Cached text embedding batch must include a batch dimension")
+        batch_size = int(self.latents.shape[0])
+        if int(self.encoder_hidden_states.shape[0]) != batch_size:
+            raise LorakitError(
+                "Cached batch tensor sizes do not match: "
+                f"latents={batch_size}, text={int(self.encoder_hidden_states.shape[0])}"
+            )
+        if len(self.record_indices) != batch_size:
+            raise LorakitError(
+                "Cached batch record-index count does not match tensor batch size"
+            )
+        if len(self.images) != batch_size:
+            raise LorakitError("Cached batch image count does not match tensor batch size")
+        if batch_size <= 0:
+            raise LorakitError("Cached batch must contain at least one item")
+
+    @classmethod
+    def from_examples(cls, examples: Sequence[CachedExample]) -> "CachedBatch":
+        if not examples:
+            raise LorakitError("Cannot collate an empty cached batch")
+        latents = [example.latents for example in examples]
+        encoder_hidden_states = [example.encoder_hidden_states for example in examples]
+        return cls(
+            latents=torch.stack(latents).to(memory_format=torch.contiguous_format),
+            encoder_hidden_states=torch.stack(encoder_hidden_states).to(
+                memory_format=torch.contiguous_format
+            ),
+            record_indices=tuple(int(example.record_index) for example in examples),
+            images=tuple(str(example.image) for example in examples),
+        )
+
+    @property
+    def size(self) -> int:
+        return int(self.latents.shape[0])
+
+    @property
+    def latent_item_shape(self) -> tuple[int, ...]:
+        return tuple(int(item) for item in self.latents.shape[1:])
+
+    @property
+    def encoder_hidden_state_item_shape(self) -> tuple[int, ...]:
+        return tuple(int(item) for item in self.encoder_hidden_states.shape[1:])
+
+
 class DiskCachedLatentDataset(Dataset):
     def __init__(self, *, records: list[CacheRecord]):
         if not records:
@@ -62,19 +131,19 @@ class DiskCachedLatentDataset(Dataset):
     def __len__(self) -> int:
         return len(self._records)
 
-    def __getitem__(self, index: int) -> dict[str, object]:
+    def __getitem__(self, index: int) -> CachedExample:
         record = self._records[index]
-        return {
-            "latents": load_tensor(record.latent_path, expected_shape=record.latent_shape),
-            "encoder_hidden_states": load_tensor(
+        return CachedExample(
+            latents=load_tensor(record.latent_path, expected_shape=record.latent_shape),
+            encoder_hidden_states=load_tensor(
                 record.encoder_hidden_state_path,
                 expected_shape=record.encoder_hidden_state_shape,
             ),
-            "record_index": index,
-            "image": record.image,
-            "latent_shape": record.latent_shape,
-            "encoder_hidden_state_shape": record.encoder_hidden_state_shape,
-        }
+            record_index=index,
+            image=record.image,
+            latent_shape=record.latent_shape,
+            encoder_hidden_state_shape=record.encoder_hidden_state_shape,
+        )
 
 
 class LatentShapeBatchSampler(BatchSampler):
@@ -429,20 +498,5 @@ def text_sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def collate_cached(examples: list[dict[str, object]]) -> dict[str, object]:
-    latents = [example["latents"] for example in examples]
-    encoder_hidden_states = [example["encoder_hidden_states"] for example in examples]
-    if not all(isinstance(value, torch.Tensor) for value in latents):
-        raise LorakitError("Cached latent batch contains non-tensor values")
-    if not all(isinstance(value, torch.Tensor) for value in encoder_hidden_states):
-        raise LorakitError("Cached text embedding batch contains non-tensor values")
-    return {
-        "latents": torch.stack(latents).to(memory_format=torch.contiguous_format),
-        "encoder_hidden_states": torch.stack(encoder_hidden_states).to(
-            memory_format=torch.contiguous_format
-        ),
-        "record_indices": [int(example["record_index"]) for example in examples],
-        "images": [str(example["image"]) for example in examples],
-        "latent_shape": list(latents[0].shape),
-        "encoder_hidden_state_shape": list(encoder_hidden_states[0].shape),
-    }
+def collate_cached(examples: Sequence[CachedExample]) -> CachedBatch:
+    return CachedBatch.from_examples(examples)

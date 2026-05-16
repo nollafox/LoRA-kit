@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from diffusers import DDPMScheduler, UNet2DConditionModel
 
-from lorakit.training.backends._cache import load_tensor
+from lorakit.training.backends._cache import CachedBatch, load_tensor
 from lorakit.training.backends._loss import fixed_subset_context_loss
 from lorakit.training.backends._validation import (
     ValidationItem,
@@ -44,10 +44,12 @@ class DiffusionValidator:
         generator = torch.Generator(device="cpu")
         generator.manual_seed(item.noise_seed)
         noise = torch.randn(item.record.latent_shape, generator=generator, dtype=torch.float32)
-        batch = {
-            "latents": latent.unsqueeze(0),
-            "encoder_hidden_states": hidden.unsqueeze(0),
-        }
+        batch = CachedBatch(
+            latents=latent.unsqueeze(0),
+            encoder_hidden_states=hidden.unsqueeze(0),
+            record_indices=(0,),
+            images=(item.record.image,),
+        )
         return fixed_subset_context_loss(
             batch=batch,
             mask=torch.tensor([True], device=self.unet.device),

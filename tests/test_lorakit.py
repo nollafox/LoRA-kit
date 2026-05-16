@@ -343,8 +343,8 @@ def test_pipeline_final_tags_fall_back_to_model_outputs_when_qwen_returns_empty(
             score=0.7,
         ),
         tagging_module.CandidateTag(
-            raw="potty",
-            tag="potty",
+            raw="bbbb",
+            tag="bbbb",
             source="ram++",
             namespace="objects",
             confidence=0.78,
@@ -356,7 +356,7 @@ def test_pipeline_final_tags_fall_back_to_model_outputs_when_qwen_returns_empty(
     assert tagging_module._final_tags_or_model_output_fallback(
         {"final_tags": []},
         merged,
-    ) == ["animal", "potty"]
+    ) == ["animal", "bbbb"]
     assert tagging_module._final_tags_or_model_output_fallback(
         {"final_tags": ["qwen tag"]},
         merged,
@@ -365,12 +365,12 @@ def test_pipeline_final_tags_fall_back_to_model_outputs_when_qwen_returns_empty(
 
 def test_pipeline_final_tags_always_include_ram_tags():
     assert tagging_module._with_required_tags(
-        ["qwen tag", "potty"],
-        ["potty", "toddler", "floor"],
-    ) == ["qwen tag", "potty", "toddler", "floor"]
+        ["qwen tag", "bbbb"],
+        ["bbbb", "aaa", "floor"],
+    ) == ["qwen tag", "bbbb", "aaa", "floor"]
     assert tagging_module._ram_tags_from_candidate_record(
-        {"ram++": {"tags": ["potty", "toddler"]}}
-    ) == ["potty", "toddler"]
+        {"ram++": {"tags": ["bbbb", "aaa"]}}
+    ) == ["bbbb", "aaa"]
 
 
 def test_pipeline_content_type_becomes_required_tag():
@@ -414,7 +414,7 @@ def test_pipeline_skips_smilingwolf_for_photo_semantics(monkeypatch):
     tagger._device = "cpu"
     tagger._torch = FakeTorchModule()
     request = tagging_module.TagRequest(Path("photo.jpg"), [])
-    candidate_record = {"ram++": {"tags": ["potty"]}, "smilingwolf": None, "errors": []}
+    candidate_record = {"ram++": {"tags": ["bbbb"]}, "smilingwolf": None, "errors": []}
 
     def fail_load(*args, **kwargs):
         raise AssertionError("SmilingWolf should not load for photo content")
@@ -574,7 +574,7 @@ def test_natural_language_preset_uses_pipeline_tagger(monkeypatch):
 
 def test_qwen_chat_image_uses_plain_paths_for_plus_filenames(tmp_path):
     captured: dict[str, object] = {}
-    image_path = tmp_path / "best+toddler+potties.webp"
+    image_path = tmp_path / "best+aaa+potties.webp"
     _image(image_path)
     judge = tagging_module.QwenVLTagJudge.__new__(tagging_module.QwenVLTagJudge)
     judge._device = "cpu"

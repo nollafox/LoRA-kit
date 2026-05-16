@@ -1,7 +1,20 @@
-"""Dynamic no-op PEFT LoRA rank growth."""
+"""Dynamic no-op PEFT LoRA rank growth.
+
+Rank growth is intentionally budgeted globally rather than applied to every
+module that clears a local residual-SVD threshold.  The probe estimates dense
+base-weight validation gradients, splits them into signal/noise halves, and then
+selects new rank channels by excess residual energy per parameter under an
+MDL-style global budget.
+
+The growth operation itself is no-op initialized: new LoRA A rows are seeded
+with selected right singular vectors and new LoRA B columns are zero, so the
+represented function is unchanged at insertion time while gradients can flow
+through the new channels on subsequent updates.
+"""
 
 from __future__ import annotations
 
+import math
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Callable, Final
@@ -27,14 +40,35 @@ from lorakit.training.backends._validation import (
 )
 
 
+# Per-layer candidate cap.  A separate global MDL/benefit-per-parameter selector
+# below decides which of these local candidates are actually grown.
 RANK_GROWTH_MAX_CHANNELS: Final = 2
 RANK_GROWTH_MIN_FREE_CUDA_BYTES: Final = 1_000_000_000
+
+# Conservative accounting for a new trainable scalar in mixed precision AdamW:
+# parameter + grad + optimizer state plus allocator overhead.  This is only used
+# to avoid overcommitting memory; the main budget is the MDL channel budget.
+RANK_GROWTH_BYTES_PER_TRAINABLE_PARAMETER: Final = 16
+
+
+@dataclass(frozen=True)
+class RankChannelCandidate:
+    module_name: str
+    adapter: str
+    channel_index: int
+    singular_value: float
+    noise_threshold: float
+    excess_residual_energy: float
+    parameter_cost: int
+    benefit_per_parameter: float
+    init_a_row: torch.Tensor
 
 
 @dataclass(frozen=True)
 class RankGrowthProposal:
     report: dict[str, object]
     init_a_rows: torch.Tensor | None
+    channel_candidates: tuple[RankChannelCandidate, ...] = ()
 
 
 def maybe_grow_lora_rank(
@@ -63,12 +97,18 @@ def maybe_grow_lora_rank(
             "free_cuda_bytes": free_cuda_bytes,
         }
 
-    proposals = dense_rank_growth_proposals(
+    raw_proposals = dense_rank_growth_proposals(
         unet=unet,
         validation_skeleton=validation_skeleton,
         noise_scheduler=noise_scheduler,
         weight_dtype=weight_dtype,
         validation_loss_tensor_for_item=validation_loss_tensor_for_item,
+    )
+    proposals, budget_report = budget_rank_growth_proposals(
+        proposals=raw_proposals,
+        validation_skeleton=validation_skeleton,
+        baseline_report=baseline_report,
+        free_cuda_bytes=free_cuda_bytes,
     )
     module_reports = {name: proposal.report for name, proposal in proposals.items()}
     accepted = False
@@ -100,7 +140,13 @@ def maybe_grow_lora_rank(
                 grown.append((layer, adapter, trial, new_named_parameters))
 
         if not grown:
-            return {"trigger": "validation_plateau", "modules": module_reports, "rank_growth_accepted": False}
+            return {
+                "trigger": "validation_plateau",
+                "rank_probe_kind": "dense_base_validation_gradient_mdl_budgeted",
+                "modules": module_reports,
+                "rank_budget": budget_report,
+                "rank_growth_accepted": False,
+            }
 
         grown_report = evaluate_validation_skeleton(
             skeleton=validation_skeleton,
@@ -133,14 +179,201 @@ def maybe_grow_lora_rank(
 
     return {
         "trigger": "validation_plateau",
-        "rank_probe_kind": "dense_base_validation_gradient",
+        "rank_probe_kind": "dense_base_validation_gradient_mdl_budgeted",
         "modules": module_reports,
+        "rank_budget": budget_report,
         "rank_growth_accepted": bool(accepted),
         "validation_loss_max_snr_bucket_delta": float(
             grown_report.loss_max_snr_bucket - baseline_report.loss_max_snr_bucket
         ),
         "validation_loss_mean_delta": float(grown_report.loss_mean - baseline_report.loss_mean),
     }
+
+
+def budget_rank_growth_proposals(
+    *,
+    proposals: dict[str, RankGrowthProposal],
+    validation_skeleton: ValidationSkeleton,
+    baseline_report: ValidationReport,
+    free_cuda_bytes: int | None,
+) -> tuple[dict[str, RankGrowthProposal], dict[str, object]]:
+    """Select a global set of rank channels by MDL-style benefit per parameter.
+
+    Each local SVD gives candidate rank-one channels.  For singular value
+    sigma_j and noise threshold tau, the excess residual energy is
+
+        max(sigma_j^2 - tau^2, 0).
+
+    The parameter cost of one LoRA channel for W in R^{d_out x d_in} is
+    d_in + d_out.  Candidates are ranked by excess energy per trainable scalar.
+
+    The global channel budget grows logarithmically with the effective number of
+    validation residual observations.  This is an MDL-style structural budget:
+    validation evidence must grow before the model is allowed to spend many more
+    adapter channels.  It prevents the previous all-modules-per-plateau behavior.
+    """
+    candidates: list[RankChannelCandidate] = [
+        candidate
+        for proposal in proposals.values()
+        for candidate in proposal.channel_candidates
+        if candidate.excess_residual_energy > 0.0 and candidate.parameter_cost > 0
+    ]
+
+    effective_observations = validation_effective_observations(validation_skeleton)
+    mdl_channel_budget = mdl_rank_channel_budget(effective_observations)
+    memory_channel_budget = memory_rank_channel_budget(
+        candidates=candidates,
+        free_cuda_bytes=free_cuda_bytes,
+    )
+    global_budget = min(mdl_channel_budget, memory_channel_budget)
+
+    selected: list[RankChannelCandidate] = []
+    used_memory_bytes = 0
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (item.benefit_per_parameter, item.excess_residual_energy),
+        reverse=True,
+    ):
+        if len(selected) >= global_budget:
+            break
+        required_bytes = int(candidate.parameter_cost * RANK_GROWTH_BYTES_PER_TRAINABLE_PARAMETER)
+        if free_cuda_bytes is not None and used_memory_bytes + required_bytes > max(
+            0,
+            free_cuda_bytes - RANK_GROWTH_MIN_FREE_CUDA_BYTES,
+        ):
+            continue
+        selected.append(candidate)
+        used_memory_bytes += required_bytes
+
+    selected_by_module: dict[str, list[RankChannelCandidate]] = {}
+    for candidate in selected:
+        selected_by_module.setdefault(candidate.module_name, []).append(candidate)
+
+    selected_proposals: dict[str, RankGrowthProposal] = {}
+    for name, proposal in proposals.items():
+        chosen = selected_by_module.get(name, [])
+        report = dict(proposal.report)
+        report["rank_probe_kind"] = "dense_base_validation_gradient_mdl_budgeted"
+        report["rank_growth_candidate_count"] = int(len(proposal.channel_candidates))
+        report["rank_growth"] = int(len(chosen))
+        if proposal.channel_candidates:
+            report["best_excess_residual_energy_per_parameter"] = float(
+                max(candidate.benefit_per_parameter for candidate in proposal.channel_candidates)
+            )
+            report["best_excess_residual_energy"] = float(
+                max(candidate.excess_residual_energy for candidate in proposal.channel_candidates)
+            )
+        else:
+            report["best_excess_residual_energy_per_parameter"] = 0.0
+            report["best_excess_residual_energy"] = 0.0
+
+        if chosen:
+            ordered = sorted(chosen, key=lambda item: item.channel_index)
+            init_a_rows = torch.stack(
+                [candidate.init_a_row.detach().float().cpu() for candidate in ordered],
+                dim=0,
+            ).contiguous()
+            report["selected_channel_indices"] = [int(candidate.channel_index) for candidate in ordered]
+            report["selected_excess_residual_energy"] = [
+                float(candidate.excess_residual_energy) for candidate in ordered
+            ]
+            report["selected_benefit_per_parameter"] = [
+                float(candidate.benefit_per_parameter) for candidate in ordered
+            ]
+        else:
+            init_a_rows = None
+            report["selected_channel_indices"] = []
+            report["selected_excess_residual_energy"] = []
+            report["selected_benefit_per_parameter"] = []
+            if int(report.get("residual_rank", 0)) > 0:
+                report.setdefault("reason", "not_selected_by_global_mdl_budget")
+
+        selected_proposals[name] = RankGrowthProposal(
+            report=report,
+            init_a_rows=init_a_rows,
+            channel_candidates=proposal.channel_candidates,
+        )
+
+    budget_report: dict[str, object] = {
+        "effective_observations": int(effective_observations),
+        "mdl_channel_budget": int(mdl_channel_budget),
+        "memory_channel_budget": int(memory_channel_budget),
+        "global_channel_budget": int(global_budget),
+        "candidate_channel_count": int(len(candidates)),
+        "selected_channel_count": int(len(selected)),
+        "selected_module_count": int(len(selected_by_module)),
+        "estimated_added_parameter_count": int(sum(candidate.parameter_cost for candidate in selected)),
+        "estimated_added_optimizer_bytes": int(used_memory_bytes),
+    }
+    if selected:
+        budget_report["min_selected_benefit_per_parameter"] = float(
+            min(candidate.benefit_per_parameter for candidate in selected)
+        )
+        budget_report["max_selected_benefit_per_parameter"] = float(
+            max(candidate.benefit_per_parameter for candidate in selected)
+        )
+    else:
+        budget_report["min_selected_benefit_per_parameter"] = 0.0
+        budget_report["max_selected_benefit_per_parameter"] = 0.0
+
+    # Include the heldout score scale so downstream analysis can compare
+    # structural growth events against the validation objective being optimized.
+    budget_report["baseline_validation_loss_mean"] = float(baseline_report.loss_mean)
+    budget_report["baseline_validation_loss_max_snr_bucket"] = float(
+        baseline_report.loss_max_snr_bucket
+    )
+    return selected_proposals, budget_report
+
+
+def validation_effective_observations(validation_skeleton: ValidationSkeleton) -> int:
+    total = 0
+    for item in validation_skeleton.items:
+        latent_shape = tuple(int(value) for value in item.record.latent_shape)
+        if not latent_shape:
+            continue
+        element_count = 1
+        for value in latent_shape:
+            element_count *= max(1, int(value))
+        total += element_count
+    return max(1, int(total))
+
+
+def mdl_rank_channel_budget(effective_observations: int) -> int:
+    """Return a logarithmic structural budget for new rank channels.
+
+    A model class should not receive linearly many new structural degrees of
+    freedom from a single plateau event.  The logarithmic budget is the MDL-style
+    part: more validation evidence permits more structural growth, but only
+    sublinearly.
+    """
+    n = max(2, int(effective_observations))
+    return max(1, int(math.log2(n)))
+
+
+def memory_rank_channel_budget(
+    *,
+    candidates: list[RankChannelCandidate],
+    free_cuda_bytes: int | None,
+) -> int:
+    if not candidates:
+        return 0
+    if free_cuda_bytes is None:
+        return len(candidates)
+    available = max(0, int(free_cuda_bytes) - RANK_GROWTH_MIN_FREE_CUDA_BYTES)
+    if available <= 0:
+        return 0
+    ordered_costs = sorted(
+        int(candidate.parameter_cost * RANK_GROWTH_BYTES_PER_TRAINABLE_PARAMETER)
+        for candidate in candidates
+    )
+    count = 0
+    used = 0
+    for cost in ordered_costs:
+        if used + cost > available:
+            break
+        used += cost
+        count += 1
+    return count
 
 
 def dense_rank_growth_proposals(
@@ -273,17 +506,36 @@ def rank_growth_proposal_from_dense_residual(
         noise_singular_values=noise_values,
     )
     residual_rank = int(torch.sum(signal_values > threshold).item())
-    growth = min(residual_rank, RANK_GROWTH_MAX_CHANNELS)
     current_rank = int(lora_a.out_features)
+    parameter_cost = int(lora_a.in_features + lora_b.out_features)
 
-    init_a_rows: torch.Tensor | None = None
-    if growth > 0:
+    channel_candidates: tuple[RankChannelCandidate, ...] = ()
+    if residual_rank > 0 and parameter_cost > 0:
         try:
             _u, _s, vh = torch.linalg.svd(signal, full_matrices=False)
-            init_a_rows = vh[:growth].to(dtype=torch.float32).contiguous()
+            candidate_count = min(residual_rank, RANK_GROWTH_MAX_CHANNELS, int(vh.shape[0]))
+            candidates: list[RankChannelCandidate] = []
+            for index in range(candidate_count):
+                singular_value = float(signal_values[index].item())
+                excess_energy = max(float(singular_value * singular_value - threshold * threshold), 0.0)
+                if excess_energy <= 0.0:
+                    continue
+                candidates.append(
+                    RankChannelCandidate(
+                        module_name=name,
+                        adapter=adapter,
+                        channel_index=index,
+                        singular_value=singular_value,
+                        noise_threshold=float(threshold),
+                        excess_residual_energy=float(excess_energy),
+                        parameter_cost=parameter_cost,
+                        benefit_per_parameter=float(excess_energy / max(1, parameter_cost)),
+                        init_a_row=vh[index].detach().float().cpu().contiguous(),
+                    )
+                )
+            channel_candidates = tuple(candidates)
         except RuntimeError:
-            growth = 0
-            init_a_rows = None
+            channel_candidates = ()
 
     return RankGrowthProposal(
         report={
@@ -298,10 +550,13 @@ def rank_growth_proposal_from_dense_residual(
             ],
             "noise_singular_median": float(torch.median(noise_values).item()) if noise_values.numel() else 0.0,
             "aspect_ratio": float(signal.shape[0] / max(1, signal.shape[1])),
-            "rank_growth": int(growth),
-            "rank_probe_kind": "dense_base_validation_gradient",
+            "rank_growth": 0,
+            "rank_growth_candidate_count": int(len(channel_candidates)),
+            "rank_probe_kind": "dense_base_validation_gradient_mdl_budgeted",
+            "parameter_cost_per_channel": int(parameter_cost),
         },
-        init_a_rows=init_a_rows,
+        init_a_rows=None,
+        channel_candidates=channel_candidates,
     )
 
 
@@ -386,7 +641,7 @@ def grow_lora_layer_noop(
         new_b.weight[:, :old_rank].copy_(lora_b.weight.detach())
         if init_a_rows is not None:
             rows = init_a_rows.detach().to(device=new_a.weight.device, dtype=new_a.weight.dtype)
-            usable = min(int(growth), rows.shape[0], new_a.weight.shape[1], rows.shape[1])
+            usable = min(int(growth), rows.shape[0])
             if usable > 0 and rows.shape[1] == new_a.weight.shape[1]:
                 new_a.weight[old_rank : old_rank + usable].copy_(rows[:usable])
     set_lora_adapter_module(layer.lora_A, adapter, new_a)

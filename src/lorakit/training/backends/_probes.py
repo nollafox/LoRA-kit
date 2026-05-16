@@ -12,9 +12,9 @@ import torch
 from diffusers import DDPMScheduler, UNet2DConditionModel
 
 from lorakit.errors import LorakitError
-from lorakit.training.backends._artifacts import jsonable_int_list, probe_extra_metadata
-from lorakit.training.backends._cache import DiskCachedLatentDataset, collate_cached
-from lorakit.training.backends._loss import batch_tensor, fixed_subset_context_loss
+from lorakit.training.backends._artifacts import probe_extra_metadata
+from lorakit.training.backends._cache import CachedBatch, DiskCachedLatentDataset, collate_cached
+from lorakit.training.backends._loss import fixed_subset_context_loss
 from lorakit.training.backends._trial import (
     apply_flat_gradient_step,
     flatten_parameters,
@@ -47,7 +47,7 @@ class ProbeConfig:
 
 @dataclass(frozen=True)
 class ProbeBatch:
-    batch: dict[str, object]
+    batch: CachedBatch
     noise: torch.Tensor
     timesteps: torch.Tensor
     source: str
@@ -125,7 +125,7 @@ class ContextProber:
     def run(
         self,
         *,
-        batch: dict[str, object],
+        batch: CachedBatch,
         noise: torch.Tensor,
         timesteps: torch.Tensor,
         probe_log_path: Path,
@@ -210,7 +210,7 @@ class ContextProber:
     def _probe_window(
         self,
         *,
-        current_batch: dict[str, object],
+        current_batch: CachedBatch,
         current_noise: torch.Tensor,
         current_timesteps: torch.Tensor,
     ) -> list[ProbeBatch]:
@@ -222,11 +222,11 @@ class ContextProber:
                 source="training_batch",
             )
         ]
-        current_size = int(batch_tensor(current_batch, "latents").shape[0])
+        current_size = current_batch.size
         extra_needed = max(0, int(self.config.window_target_items) - current_size)
         if extra_needed <= 0 or len(self.dataset) <= 0:
             return probe_batches
-        excluded = set(jsonable_int_list(current_batch.get("record_indices")))
+        excluded = set(current_batch.record_indices)
         candidates = [index for index in range(len(self.dataset)) if index not in excluded]
         random.shuffle(candidates)
         for index in candidates[:extra_needed]:
@@ -243,8 +243,8 @@ class ContextProber:
             )
         return probe_batches
 
-    def _sample_noise_and_timesteps(self, *, batch: dict[str, object]) -> tuple[torch.Tensor, torch.Tensor]:
-        latents = batch_tensor(batch, "latents").to(device=self.unet.device, dtype=self.weight_dtype)
+    def _sample_noise_and_timesteps(self, *, batch: CachedBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        latents = batch.latents.to(device=self.unet.device, dtype=self.weight_dtype)
         noise = torch.randn_like(latents)
         timesteps = torch.randint(
             0,

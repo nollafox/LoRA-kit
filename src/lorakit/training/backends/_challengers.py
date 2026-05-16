@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 from diffusers import DDPMScheduler, UNet2DConditionModel
 
+from lorakit.training.backends._cache import CachedBatch
 from lorakit.training.backends._evaluator import DiffusionValidator
 from lorakit.training.backends._loss import loss_context_fixed
 from lorakit.training.backends._optimizer import set_lora_plus_optimizer_ratio
@@ -27,7 +28,7 @@ from lorakit.training.certified_stepper import trainable_parameters
 
 @dataclass(frozen=True)
 class FrozenBatch:
-    batch: dict[str, object]
+    batch: CachedBatch
     noise: torch.Tensor
     timesteps: torch.Tensor
 
