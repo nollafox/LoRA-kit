@@ -677,7 +677,7 @@ def certify_losses(
     mean_delta = new_mean - old_mean
     max_delta = new_max - old_max
 
-    accepted_strict = max_delta <= 0.0 and mean_delta <= 0.0
+    accepted_strict = mean_delta <= 0.0 and bool(torch.all(deltas <= 0.0).item())
     accepted_tolerant = max_delta <= tolerance and mean_delta <= tolerance
     accepted_strong = accepted_tolerant and bool(torch.all(deltas <= float(tolerance)).item())
     accepted_bottleneck = accepted_tolerant
@@ -698,8 +698,10 @@ def certify_losses(
         if float(delta) > float(tolerance)
     )
 
-    if accepted_strong:
+    if accepted_strong and accepted_strict:
         reason = "accepted_strong_no_context_worsened"
+    elif accepted_strong:
+        reason = "accepted_strong_no_context_worsened_beyond_tolerance"
     elif accepted_bottleneck:
         reason = "accepted_bottleneck_mean_and_max_nonworsening"
     else:

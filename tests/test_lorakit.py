@@ -1054,20 +1054,6 @@ def test_clip_text_model_compatibility_patch_removed():
     assert not hasattr(CLIPTextModel, "text_model")
 
 
-def test_move_module_to_device_handles_meta_tensors(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
-
-    module = torch.nn.Module()
-    module.param = torch.nn.Parameter(torch.empty(2, 2, device="meta"))
-    module.register_buffer("buf", torch.empty(1, device="meta"))
-
-    moved = diffusers_backend._move_module_to_device(module, torch.device("cpu"), dtype=torch.float32)
-
-    assert moved.param.device == torch.device("cpu")
-    assert moved.buf.device == torch.device("cpu")
-    assert moved.param.dtype == torch.float32
-
-
 def test_diffusers_load_rows_accepts_mixed_vae_compatible_image_shapes(tmp_path):
     from lorakit.training.backends import diffusers as diffusers_backend
 
@@ -1102,7 +1088,7 @@ def test_diffusers_load_rows_rejects_non_vae_compatible_image_shapes(tmp_path):
 
 
 def test_diffusers_disk_cache_dataset_validates_and_loads_tensors(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     latent_path = tmp_path / "latents" / "00000000.pt"
     hidden_path = tmp_path / "text" / "00000000.pt"
@@ -1110,7 +1096,7 @@ def test_diffusers_disk_cache_dataset_validates_and_loads_tensors(tmp_path):
     hidden_path.parent.mkdir(parents=True)
     torch.save(torch.zeros(4, 8, 8), latent_path)
     torch.save(torch.zeros(77, 768), hidden_path)
-    record = diffusers_backend._CacheRecord(
+    record = _cache.CacheRecord(
         image="images/a.png",
         caption_sha256="caption",
         image_sha256="image",
@@ -1120,7 +1106,7 @@ def test_diffusers_disk_cache_dataset_validates_and_loads_tensors(tmp_path):
         encoder_hidden_state_shape=(77, 768),
     )
 
-    dataset = diffusers_backend._DiskCachedLatentDataset(records=[record])
+    dataset = _cache.DiskCachedLatentDataset(records=[record])
 
     item = dataset[0]
     assert tuple(item["latents"].shape) == (4, 8, 8)
@@ -1128,14 +1114,14 @@ def test_diffusers_disk_cache_dataset_validates_and_loads_tensors(tmp_path):
 
 
 def test_diffusers_latent_shape_batch_sampler_never_mixes_shapes(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     records = [
         _diffusers_cache_record(tmp_path, 0, latent_shape=(4, 8, 8)),
         _diffusers_cache_record(tmp_path, 1, latent_shape=(4, 8, 8)),
         _diffusers_cache_record(tmp_path, 2, latent_shape=(4, 4, 8)),
     ]
-    sampler = diffusers_backend._LatentShapeBatchSampler(records=records, batch_size=2)
+    sampler = _cache.LatentShapeBatchSampler(records=records, batch_size=2)
 
     for batch in sampler:
         shapes = {records[index].latent_shape for index in batch}
@@ -1143,15 +1129,15 @@ def test_diffusers_latent_shape_batch_sampler_never_mixes_shapes(tmp_path):
 
 
 def test_diffusers_pixel_shape_cache_batches_group_compatible_images(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     rows = [
-        diffusers_backend._TrainingRow("a.png", "a", tmp_path / "a.png", "a", 32, 32),
-        diffusers_backend._TrainingRow("b.png", "b", tmp_path / "b.png", "b", 64, 32),
-        diffusers_backend._TrainingRow("c.png", "c", tmp_path / "c.png", "c", 32, 32),
+        _cache.TrainingRow("a.png", "a", tmp_path / "a.png", "a", 32, 32),
+        _cache.TrainingRow("b.png", "b", tmp_path / "b.png", "b", 64, 32),
+        _cache.TrainingRow("c.png", "c", tmp_path / "c.png", "c", 32, 32),
     ]
 
-    batches = diffusers_backend._pixel_shape_cache_batches(rows)
+    batches = list(_cache.pixel_shape_buckets(rows).values())
 
     for batch in batches:
         shapes = {(rows[index].width, rows[index].height) for index in batch}
@@ -1159,7 +1145,7 @@ def test_diffusers_pixel_shape_cache_batches_group_compatible_images(tmp_path):
 
 
 def test_diffusers_adaptive_cuda_batches_retries_smaller_batches(monkeypatch):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     calls = []
 
@@ -1168,9 +1154,9 @@ def test_diffusers_adaptive_cuda_batches_retries_smaller_batches(monkeypatch):
         if len(indices) > 1:
             raise RuntimeError("CUDA out of memory")
 
-    monkeypatch.setattr(diffusers_backend, "_cleanup_after_cuda_oom", lambda: None)
+    monkeypatch.setattr(_cache, "cleanup_after_cuda_oom", lambda: None)
 
-    diffusers_backend._adaptive_cuda_batches(
+    _cache.adaptive_cuda_batches(
         indices=[0, 1, 2],
         initial_batch_size=4,
         encode_batch=encode_batch,
@@ -1180,14 +1166,14 @@ def test_diffusers_adaptive_cuda_batches_retries_smaller_batches(monkeypatch):
 
 
 def test_diffusers_adaptive_cuda_batches_preserves_index_order():
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     encoded = []
 
     def encode_batch(indices):
         encoded.extend(indices)
 
-    diffusers_backend._adaptive_cuda_batches(
+    _cache.adaptive_cuda_batches(
         indices=[3, 1, 2, 0],
         initial_batch_size=2,
         encode_batch=encode_batch,
@@ -1197,15 +1183,15 @@ def test_diffusers_adaptive_cuda_batches_preserves_index_order():
 
 
 def test_diffusers_adaptive_cuda_batches_reports_single_item_oom(monkeypatch):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     def encode_batch(indices):
         raise RuntimeError("CUDA out of memory")
 
-    monkeypatch.setattr(diffusers_backend, "_cleanup_after_cuda_oom", lambda: None)
+    monkeypatch.setattr(_cache, "cleanup_after_cuda_oom", lambda: None)
 
     with pytest.raises(LorakitError, match="single cache item"):
-        diffusers_backend._adaptive_cuda_batches(
+        _cache.adaptive_cuda_batches(
             indices=[0],
             initial_batch_size=1,
             encode_batch=encode_batch,
@@ -1213,22 +1199,57 @@ def test_diffusers_adaptive_cuda_batches_reports_single_item_oom(monkeypatch):
 
 
 def test_diffusers_probe_scheduler_uses_initial_cadence_and_memory(monkeypatch):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _probes
 
-    assert diffusers_backend._should_probe_contexts(global_step=0, sync_gradients=True)
-    assert diffusers_backend._should_probe_contexts(global_step=2, sync_gradients=True)
-    assert not diffusers_backend._should_probe_contexts(global_step=3, sync_gradients=True)
-    assert not diffusers_backend._should_probe_contexts(global_step=25, sync_gradients=False)
+    config = _probes.ProbeConfig(
+        initial_steps=3,
+        every_steps=25,
+        min_free_cuda_bytes=500_000_000,
+        window_target_items=4,
+        version=5,
+        backtrack_factors=(1.0, 0.5),
+    )
 
-    monkeypatch.setattr(diffusers_backend, "_cuda_free_bytes", lambda: 2_000_000_000)
-    assert diffusers_backend._should_probe_contexts(global_step=25, sync_gradients=True)
-
-    monkeypatch.setattr(diffusers_backend, "_cuda_free_bytes", lambda: 1)
-    assert not diffusers_backend._should_probe_contexts(global_step=25, sync_gradients=True)
+    assert _probes.should_probe_contexts(
+        global_step=0,
+        sync_gradients=True,
+        free_cuda_bytes=None,
+        config=config,
+    )
+    assert _probes.should_probe_contexts(
+        global_step=2,
+        sync_gradients=True,
+        free_cuda_bytes=None,
+        config=config,
+    )
+    assert not _probes.should_probe_contexts(
+        global_step=3,
+        sync_gradients=True,
+        free_cuda_bytes=None,
+        config=config,
+    )
+    assert not _probes.should_probe_contexts(
+        global_step=25,
+        sync_gradients=False,
+        free_cuda_bytes=None,
+        config=config,
+    )
+    assert _probes.should_probe_contexts(
+        global_step=25,
+        sync_gradients=True,
+        free_cuda_bytes=2_000_000_000,
+        config=config,
+    )
+    assert not _probes.should_probe_contexts(
+        global_step=25,
+        sync_gradients=True,
+        free_cuda_bytes=1,
+        config=config,
+    )
 
 
 def test_diffusers_streaming_probe_does_not_mutate_existing_grads(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _probes
 
     class FakeSchedulerConfig:
         num_train_timesteps = 10
@@ -1269,13 +1290,24 @@ def test_diffusers_streaming_probe_does_not_mutate_existing_grads(tmp_path):
     unet.weight.grad = torch.tensor(123.0)
     optimizer = torch.optim.SGD(unet.parameters(), lr=0.01)
 
-    diffusers_backend._write_streaming_context_probe_if_main(
+    prober = _probes.ContextProber(
         unet=unet,
         optimizer=optimizer,
         dataset=EmptyDataset(),
-        batch=batch,
         noise_scheduler=FakeScheduler(),
         weight_dtype=torch.float32,
+        config=_probes.ProbeConfig(
+            initial_steps=3,
+            every_steps=25,
+            min_free_cuda_bytes=500_000_000,
+            window_target_items=4,
+            version=5,
+            backtrack_factors=(1.0, 0.5),
+        ),
+        cuda_memory_snapshot=lambda: None,
+    )
+    prober.run(
+        batch=batch,
         noise=noise,
         timesteps=timesteps,
         probe_log_path=tmp_path / "probe.jsonl",
@@ -1294,135 +1326,83 @@ def test_diffusers_streaming_probe_does_not_mutate_existing_grads(tmp_path):
     assert payload["context_ids"] == [1, 2]
 
 
-def test_diffusers_guardrail_commits_adamw_when_certificate_passes():
-    from lorakit.training import certified_stepper
-    from lorakit.training.backends import diffusers as diffusers_backend
+def test_trial_state_restores_parameter_values_when_not_committed():
+    from lorakit.training.backends import _trial
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+
+    with _trial.trial_state([parameter]):
+        parameter.data.add_(1.0)
+
+    assert float(parameter.item()) == pytest.approx(1.0)
+
+
+def test_trial_state_preserves_committed_parameter_values():
+    from lorakit.training.backends import _trial
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+
+    with _trial.trial_state([parameter]) as trial:
+        parameter.data.add_(1.0)
+        trial.commit()
+
+    assert float(parameter.item()) == pytest.approx(2.0)
+
+
+def test_trial_state_restores_gradients_and_none_gradients():
+    from lorakit.training.backends import _trial
+
+    with_grad = torch.nn.Parameter(torch.tensor([1.0]))
+    without_grad = torch.nn.Parameter(torch.tensor([2.0]))
+    with_grad.grad = torch.tensor([3.0])
+
+    with _trial.trial_state([with_grad, without_grad]):
+        with_grad.grad = torch.tensor([9.0])
+        without_grad.grad = torch.tensor([5.0])
+
+    assert with_grad.grad is not None
+    assert float(with_grad.grad.item()) == pytest.approx(3.0)
+    assert without_grad.grad is None
+
+
+def test_trial_state_restores_optimizer_state_after_step():
+    from lorakit.training.backends import _trial
 
     parameter = torch.nn.Parameter(torch.tensor([1.0]))
     optimizer = torch.optim.AdamW([parameter], lr=0.1)
     parameter.grad = torch.tensor([1.0])
-    parameter_snapshot = diffusers_backend._snapshot_trainable_parameters([parameter])
-    gradient_snapshot = diffusers_backend._snapshot_trainable_gradients([parameter])
-    optimizer_snapshot = diffusers_backend._snapshot_optimizer_state(optimizer)
-    certificate = certified_stepper.certify_losses(
-        old_context_losses=torch.tensor([1.0]),
-        new_context_losses=torch.tensor([0.9]),
-        backtracks=0,
-        step_size=0.1,
-    )
-
-    decision = diffusers_backend._commit_certified_guardrail_update(
-        unet=None,
-        optimizer=optimizer,
-        parameters=[parameter],
-        parameter_snapshot=parameter_snapshot,
-        gradient_snapshot=gradient_snapshot,
-        optimizer_snapshot=optimizer_snapshot,
-        probe_batches=[],
-        noise_scheduler=None,
-        weight_dtype=torch.float32,
-        context_ids=(1,),
-        old_context_losses=torch.tensor([1.0]),
-        candidate_gradients={},
-        candidate_certificates={"adamw_actual": certificate},
-        step_size=0.1,
-    )
-
-    assert decision.committed_update == "adamw_actual"
-    assert decision.handled_update
-    assert float(parameter.item()) < 1.0
-
-
-def test_diffusers_guardrail_backtracks_adamw_when_full_step_fails(monkeypatch):
-    from lorakit.training import certified_stepper
-    from lorakit.training.backends import diffusers as diffusers_backend
-
-    parameter = torch.nn.Parameter(torch.tensor([1.0]))
-    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    optimizer.step()
+    baseline_step = optimizer.state[parameter]["step"].detach().clone()
     parameter.grad = torch.tensor([1.0])
-    parameter_snapshot = diffusers_backend._snapshot_trainable_parameters([parameter])
-    gradient_snapshot = diffusers_backend._snapshot_trainable_gradients([parameter])
-    optimizer_snapshot = diffusers_backend._snapshot_optimizer_state(optimizer)
-    rejected = certified_stepper.certify_losses(
-        old_context_losses=torch.tensor([1.0]),
-        new_context_losses=torch.tensor([1.2]),
-        backtracks=0,
-        step_size=1.0,
-    )
-    monkeypatch.setattr(
-        diffusers_backend,
-        "_evaluate_probe_context_losses",
-        lambda **_: torch.tensor([float(parameter.item() ** 2)]),
-    )
 
-    decision = diffusers_backend._commit_certified_guardrail_update(
-        unet=None,
-        optimizer=optimizer,
+    with _trial.trial_state([parameter], optimizer):
+        optimizer.step()
+
+    assert optimizer.state[parameter]["step"].item() == pytest.approx(baseline_step.item())
+
+
+def test_trial_update_utilities_match_expected_parameter_changes():
+    from lorakit.training.backends import _trial
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 3.0]))
+    before = [parameter.detach().clone()]
+    parameter.data.add_(torch.tensor([2.0, -2.0]))
+
+    assert _trial.update_norm(parameters=[parameter], before=before) == pytest.approx(2.0 * 2.0**0.5)
+
+    _trial.scale_update(parameters=[parameter], before=before, factor=0.5)
+    assert parameter.detach().tolist() == pytest.approx([2.0, 2.0])
+
+    _trial.apply_flat_gradient_step(
         parameters=[parameter],
-        parameter_snapshot=parameter_snapshot,
-        gradient_snapshot=gradient_snapshot,
-        optimizer_snapshot=optimizer_snapshot,
-        probe_batches=[],
-        noise_scheduler=None,
-        weight_dtype=torch.float32,
-        context_ids=(1,),
-        old_context_losses=torch.tensor([1.0]),
-        candidate_gradients={},
-        candidate_certificates={"adamw_actual": rejected},
-        step_size=1.0,
+        flat_gradient=torch.tensor([1.0, -1.0]),
+        step_size=0.25,
     )
-
-    assert decision.committed_update == "adamw_actual_backtracked"
-    assert decision.backtracks == 1
-    assert float(parameter.item()) == pytest.approx(0.5)
-
-
-def test_diffusers_guardrail_skips_update_when_all_candidates_fail(monkeypatch):
-    from lorakit.training import certified_stepper
-    from lorakit.training.backends import diffusers as diffusers_backend
-
-    parameter = torch.nn.Parameter(torch.tensor([1.0]))
-    optimizer = torch.optim.SGD([parameter], lr=1.0)
-    parameter.grad = torch.tensor([1.0])
-    parameter_snapshot = diffusers_backend._snapshot_trainable_parameters([parameter])
-    gradient_snapshot = diffusers_backend._snapshot_trainable_gradients([parameter])
-    optimizer_snapshot = diffusers_backend._snapshot_optimizer_state(optimizer)
-    rejected = certified_stepper.certify_losses(
-        old_context_losses=torch.tensor([1.0]),
-        new_context_losses=torch.tensor([1.2]),
-        backtracks=0,
-        step_size=1.0,
-    )
-    monkeypatch.setattr(
-        diffusers_backend,
-        "_evaluate_probe_context_losses",
-        lambda **_: torch.tensor([2.0]),
-    )
-
-    decision = diffusers_backend._commit_certified_guardrail_update(
-        unet=None,
-        optimizer=optimizer,
-        parameters=[parameter],
-        parameter_snapshot=parameter_snapshot,
-        gradient_snapshot=gradient_snapshot,
-        optimizer_snapshot=optimizer_snapshot,
-        probe_batches=[],
-        noise_scheduler=None,
-        weight_dtype=torch.float32,
-        context_ids=(1,),
-        old_context_losses=torch.tensor([1.0]),
-        candidate_gradients={"mgda_sgd_proxy": torch.tensor([1.0])},
-        candidate_certificates={"adamw_actual": rejected, "mgda_sgd_proxy": rejected},
-        step_size=1.0,
-    )
-
-    assert decision.committed_update == "skip_update"
-    assert decision.skipped_update
-    assert float(parameter.item()) == pytest.approx(1.0)
+    assert parameter.detach().tolist() == pytest.approx([1.75, 2.25])
 
 
 def test_diffusers_probe_summary_counts_guardrail_outcomes(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _artifacts
 
     probe_log = tmp_path / "context-probes.jsonl"
     probe_log.write_text(
@@ -1475,7 +1455,7 @@ def test_diffusers_probe_summary_counts_guardrail_outcomes(tmp_path):
     )
     summary_path = tmp_path / "context-probes-summary.json"
 
-    diffusers_backend._write_probe_summary(
+    _artifacts.write_probe_summary(
         probe_log_path=probe_log,
         summary_path=summary_path,
     )
@@ -1492,10 +1472,10 @@ def test_diffusers_probe_summary_counts_guardrail_outcomes(tmp_path):
 
 
 def test_diffusers_validation_split_is_deterministic_and_keeps_training_records():
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache, _validation
 
     records = [
-        diffusers_backend._CacheRecord(
+        _cache.CacheRecord(
             image=f"{index}.png",
             caption_sha256=f"caption-{index}",
             image_sha256=f"{index:064x}",
@@ -1507,8 +1487,8 @@ def test_diffusers_validation_split_is_deterministic_and_keeps_training_records(
         for index in range(20)
     ]
 
-    first_train, first_validation = diffusers_backend._split_train_validation_records(records)
-    second_train, second_validation = diffusers_backend._split_train_validation_records(list(reversed(records)))
+    first_train, first_validation = _validation.split_train_validation_records(records)
+    second_train, second_validation = _validation.split_train_validation_records(list(reversed(records)))
 
     assert sorted(record.image_sha256 for record in first_validation) == sorted(
         record.image_sha256 for record in second_validation
@@ -1518,7 +1498,7 @@ def test_diffusers_validation_split_is_deterministic_and_keeps_training_records(
 
 
 def test_diffusers_validation_skeleton_has_fixed_timesteps_and_snr_buckets(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache, _validation
 
     class FakeSchedulerConfig:
         num_train_timesteps = 9
@@ -1528,7 +1508,7 @@ def test_diffusers_validation_skeleton_has_fixed_timesteps_and_snr_buckets(tmp_p
         alphas_cumprod = torch.linspace(0.99, 0.01, 9)
 
     records = [
-        diffusers_backend._CacheRecord(
+        _cache.CacheRecord(
             image=f"{index}.png",
             caption_sha256=f"caption-{index}",
             image_sha256=f"{index + 1:064x}",
@@ -1540,7 +1520,7 @@ def test_diffusers_validation_skeleton_has_fixed_timesteps_and_snr_buckets(tmp_p
         for index in range(3)
     ]
 
-    skeleton = diffusers_backend._build_validation_skeleton(
+    skeleton = _validation.build_validation_skeleton(
         records=records,
         noise_scheduler=FakeScheduler(),
     )
@@ -1555,12 +1535,12 @@ def test_diffusers_validation_skeleton_has_fixed_timesteps_and_snr_buckets(tmp_p
 
 
 def test_diffusers_best_checkpoint_selection_prefers_bottleneck_then_mean(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _validation
 
-    empty = diffusers_backend._BestCheckpoint.empty(tmp_path / "best.safetensors")
-    improved, first = diffusers_backend._select_best_checkpoint(
+    empty = _validation.BestCheckpoint.empty(tmp_path / "best.safetensors")
+    improved, first = _validation.select_best_checkpoint(
         current=empty,
-        report=diffusers_backend._ValidationReport(
+        report=_validation.ValidationReport(
             step=2,
             loss_mean=0.5,
             loss_max_snr_bucket=0.7,
@@ -1570,9 +1550,9 @@ def test_diffusers_best_checkpoint_selection_prefers_bottleneck_then_mean(tmp_pa
     )
     assert improved
 
-    improved, second = diffusers_backend._select_best_checkpoint(
+    improved, second = _validation.select_best_checkpoint(
         current=first,
-        report=diffusers_backend._ValidationReport(
+        report=_validation.ValidationReport(
             step=3,
             loss_mean=0.4,
             loss_max_snr_bucket=0.8,
@@ -1583,9 +1563,9 @@ def test_diffusers_best_checkpoint_selection_prefers_bottleneck_then_mean(tmp_pa
     assert not improved
     assert second == first
 
-    improved, third = diffusers_backend._select_best_checkpoint(
+    improved, third = _validation.select_best_checkpoint(
         current=first,
-        report=diffusers_backend._ValidationReport(
+        report=_validation.ValidationReport(
             step=4,
             loss_mean=0.6,
             loss_max_snr_bucket=0.6,
@@ -1598,28 +1578,31 @@ def test_diffusers_best_checkpoint_selection_prefers_bottleneck_then_mean(tmp_pa
 
 
 def test_diffusers_snr_weights_match_epsilon_and_v_prediction():
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _policy, _validation
 
-    class FakeScheduler:
+    class EpsilonScheduler:
+        config = type("Config", (), {"prediction_type": "epsilon"})()
+        alphas_cumprod = torch.tensor([0.8, 0.5, 0.2])
+
+    class VScheduler:
+        config = type("Config", (), {"prediction_type": "v_prediction"})()
         alphas_cumprod = torch.tensor([0.8, 0.5, 0.2])
 
     timesteps = torch.tensor([0, 1, 2])
-    snr = diffusers_backend._snr_for_timesteps(
-        noise_scheduler=FakeScheduler(),
+    snr = _validation.snr_for_timesteps(
+        noise_scheduler=EpsilonScheduler(),
         timesteps=timesteps,
     )
 
-    epsilon = diffusers_backend._snr_loss_weights(
+    epsilon = _policy.snr_loss_weights(
+        objective=_policy.ObjectivePolicy(name="minsnr", gamma=1.0),
         timesteps=timesteps,
-        noise_scheduler=FakeScheduler(),
-        gamma=1.0,
-        prediction_type="epsilon",
+        noise_scheduler=EpsilonScheduler(),
     )
-    v_prediction = diffusers_backend._snr_loss_weights(
+    v_prediction = _policy.snr_loss_weights(
+        objective=_policy.ObjectivePolicy(name="minsnr", gamma=1.0),
         timesteps=timesteps,
-        noise_scheduler=FakeScheduler(),
-        gamma=1.0,
-        prediction_type="v_prediction",
+        noise_scheduler=VScheduler(),
     )
 
     assert torch.isfinite(epsilon).all()
@@ -1629,23 +1612,23 @@ def test_diffusers_snr_weights_match_epsilon_and_v_prediction():
 
 
 def test_diffusers_validation_score_improves_only_beyond_tolerance():
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _validation
 
-    baseline = diffusers_backend._ValidationReport(
+    baseline = _validation.ValidationReport(
         step=1,
         loss_mean=0.5,
         loss_max_snr_bucket=1.0,
         loss_by_snr_bucket={"high": 1.0, "mid": 0.5, "low": 0.25},
         item_count=3,
     )
-    tiny = diffusers_backend._ValidationReport(
+    tiny = _validation.ValidationReport(
         step=2,
         loss_mean=0.5,
         loss_max_snr_bucket=1.0 - 1e-8,
         loss_by_snr_bucket={"high": 1.0 - 1e-8, "mid": 0.5, "low": 0.25},
         item_count=3,
     )
-    better = diffusers_backend._ValidationReport(
+    better = _validation.ValidationReport(
         step=2,
         loss_mean=0.5,
         loss_max_snr_bucket=0.99,
@@ -1653,26 +1636,26 @@ def test_diffusers_validation_score_improves_only_beyond_tolerance():
         item_count=3,
     )
 
-    assert not diffusers_backend._validation_score_improves(baseline=baseline, candidate=tiny)
-    assert diffusers_backend._validation_score_improves(baseline=baseline, candidate=better)
+    assert not _validation.validation_score_improves(baseline=baseline, candidate=tiny)
+    assert _validation.validation_score_improves(baseline=baseline, candidate=better)
 
 
 def test_diffusers_objective_switches_only_when_candidate_beats_validation(monkeypatch):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _challengers, _policy, _validation
 
     module = torch.nn.Linear(1, 1, bias=False)
     module.weight.grad = torch.ones_like(module.weight)
     optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
-    baseline = diffusers_backend._ValidationReport(
+    baseline = _validation.ValidationReport(
         step=1,
         loss_mean=1.0,
         loss_max_snr_bucket=1.0,
         loss_by_snr_bucket={"mid": 1.0},
         item_count=1,
     )
-    skeleton = diffusers_backend._ValidationSkeleton(
+    skeleton = _validation.ValidationSkeleton(
         items=(
-            diffusers_backend._ValidationItem(
+            _validation.ValidationItem(
                 record=None,
                 timestep=0,
                 noise_seed=1,
@@ -1681,11 +1664,13 @@ def test_diffusers_objective_switches_only_when_candidate_beats_validation(monke
             ),
         )
     )
+    validator = type("Validator", (), {"skeleton": skeleton})()
 
-    def fake_virtual(**kwargs):
+    def fake_virtual(self, **kwargs):
+        del self
         objective = kwargs["objective"]
         if objective.name == "minsnr":
-            return diffusers_backend._ValidationReport(
+            return _validation.ValidationReport(
                 step=1,
                 loss_mean=0.5,
                 loss_max_snr_bucket=0.5,
@@ -1694,19 +1679,20 @@ def test_diffusers_objective_switches_only_when_candidate_beats_validation(monke
             )
         return baseline
 
-    monkeypatch.setattr(diffusers_backend, "_virtual_policy_step_validation_report", fake_virtual)
-    monkeypatch.setattr(diffusers_backend, "_lora_plus_candidate_ratios", lambda _unet: [1.0])
+    monkeypatch.setattr(_challengers.PolicyChallenger, "_virtual_step_report", fake_virtual)
 
-    policy, log = diffusers_backend._challenge_quality_policies(
-        current_policy=diffusers_backend._default_training_policy(),
-        batch={},
+    challenger = _challengers.PolicyChallenger(
         unet=module,
         optimizer=optimizer,
-        validation_skeleton=skeleton,
-        baseline_report=baseline,
+        validator=validator,
         noise_scheduler=None,
         weight_dtype=torch.float32,
         learning_rate=0.1,
+    )
+    policy, log = challenger.choose(
+        current_policy=_policy.default_training_policy(),
+        frozen_batch=_challengers.FrozenBatch(batch={}, noise=torch.empty(0), timesteps=torch.empty(0, dtype=torch.long)),
+        baseline=baseline,
     )
 
     assert policy.objective.name == "minsnr"
@@ -1714,28 +1700,28 @@ def test_diffusers_objective_switches_only_when_candidate_beats_validation(monke
 
 
 def test_diffusers_objective_stays_base_when_candidates_do_not_improve(monkeypatch):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _challengers, _policy, _validation
 
     module = torch.nn.Linear(1, 1, bias=False)
     module.weight.grad = torch.ones_like(module.weight)
     optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
-    baseline = diffusers_backend._ValidationReport(
+    baseline = _validation.ValidationReport(
         step=1,
         loss_mean=1.0,
         loss_max_snr_bucket=1.0,
         loss_by_snr_bucket={"mid": 1.0},
         item_count=1,
     )
-    worse = diffusers_backend._ValidationReport(
+    worse = _validation.ValidationReport(
         step=1,
         loss_mean=1.1,
         loss_max_snr_bucket=1.1,
         loss_by_snr_bucket={"mid": 1.1},
         item_count=1,
     )
-    skeleton = diffusers_backend._ValidationSkeleton(
+    skeleton = _validation.ValidationSkeleton(
         items=(
-            diffusers_backend._ValidationItem(
+            _validation.ValidationItem(
                 record=None,
                 timestep=0,
                 noise_seed=1,
@@ -1744,20 +1730,26 @@ def test_diffusers_objective_stays_base_when_candidates_do_not_improve(monkeypat
             ),
         )
     )
+    validator = type("Validator", (), {"skeleton": skeleton})()
 
-    monkeypatch.setattr(diffusers_backend, "_virtual_policy_step_validation_report", lambda **_: worse)
-    monkeypatch.setattr(diffusers_backend, "_lora_plus_candidate_ratios", lambda _unet: [1.0])
+    monkeypatch.setattr(
+        _challengers.PolicyChallenger,
+        "_virtual_step_report",
+        lambda self, **_: worse,
+    )
 
-    policy, log = diffusers_backend._challenge_quality_policies(
-        current_policy=diffusers_backend._default_training_policy(),
-        batch={},
+    challenger = _challengers.PolicyChallenger(
         unet=module,
         optimizer=optimizer,
-        validation_skeleton=skeleton,
-        baseline_report=baseline,
+        validator=validator,
         noise_scheduler=None,
         weight_dtype=torch.float32,
         learning_rate=0.1,
+    )
+    policy, log = challenger.choose(
+        current_policy=_policy.default_training_policy(),
+        frozen_batch=_challengers.FrozenBatch(batch={}, noise=torch.empty(0), timesteps=torch.empty(0, dtype=torch.long)),
+        baseline=baseline,
     )
 
     assert policy.objective.name == "base_mse"
@@ -1765,7 +1757,7 @@ def test_diffusers_objective_stays_base_when_candidates_do_not_improve(monkeypat
 
 
 def test_diffusers_lora_partition_and_ratio_application():
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _optimizer, _policy
 
     class FakeLora(torch.nn.Module):
         def __init__(self):
@@ -1777,17 +1769,22 @@ def test_diffusers_lora_partition_and_ratio_application():
     for parameter in module.parameters():
         parameter.grad = torch.ones_like(parameter)
 
-    lora_a, lora_b = diffusers_backend._partition_lora_parameters(module)
+    lora_a, lora_b = _policy.partition_lora_parameters(module)
     assert lora_a == [module.lora_A.weight]
     assert lora_b == [module.lora_B.weight]
 
-    diffusers_backend._apply_lora_plus_gradient_ratio(unet=module, ratio=3.0)
-    assert module.lora_A.weight.grad.item() == pytest.approx(1.0)
-    assert module.lora_B.weight.grad.item() == pytest.approx(3.0)
+    optimizer = torch.optim.SGD(
+        _optimizer.lora_plus_optimizer_groups(module, base_learning_rate=0.1, ratio=1.0)
+    )
+    _optimizer.set_lora_plus_optimizer_ratio(optimizer, base_learning_rate=0.1, ratio=3.0)
+
+    rates = {group["lorakit_group"]: group["lr"] for group in optimizer.param_groups}
+    assert rates["lora_A"] == pytest.approx(0.1)
+    assert rates["lora_B"] == pytest.approx(0.3)
 
 
 def test_diffusers_noop_rank_growth_preserves_lora_output_and_weights():
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _rank
 
     class FakeLayer(torch.nn.Module):
         def __init__(self):
@@ -1810,7 +1807,7 @@ def test_diffusers_noop_rank_growth_preserves_lora_output_and_weights():
     x = torch.randn(5, 3)
     before = layer(x).detach().clone()
 
-    assert diffusers_backend._grow_lora_layer_noop(layer=layer, adapter="default", growth=2)
+    assert _rank.grow_lora_layer_noop(layer=layer, adapter="default", growth=2)
 
     after = layer(x).detach()
     assert torch.allclose(after, before)
@@ -1825,7 +1822,7 @@ def test_diffusers_noop_rank_growth_preserves_lora_output_and_weights():
 
 
 def test_diffusers_rank_growth_report_skips_when_signal_below_noise():
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _rank
 
     class FakeLayer(torch.nn.Module):
         def __init__(self):
@@ -1840,23 +1837,29 @@ def test_diffusers_rank_growth_report_skips_when_signal_below_noise():
     layer.lora_A["default"].weight.grad = torch.ones_like(layer.lora_A["default"].weight)
     layer.lora_B["default"].weight.grad = -torch.ones_like(layer.lora_B["default"].weight)
 
-    report = diffusers_backend._rank_growth_report_for_layer(name="fake", layer=layer)
+    proposal = _rank.rank_growth_proposal_from_dense_residual(
+        name="fake",
+        layer=layer,
+        first_gradient=torch.ones(2, 2),
+        second_gradient=-torch.ones(2, 2),
+    )
+    report = proposal.report
 
     assert report["residual_rank"] == 0
     assert report["rank_growth"] == 0
 
 
-def test_diffusers_rank_growth_skips_when_memory_is_low(monkeypatch):
-    from lorakit.training.backends import diffusers as diffusers_backend
+def test_diffusers_rank_growth_skips_when_memory_is_low():
+    from lorakit.training.backends import _rank, _validation
 
     module = torch.nn.Module()
-    monkeypatch.setattr(diffusers_backend, "_cuda_free_bytes", lambda: 1)
 
-    report = diffusers_backend._maybe_grow_lora_rank(
+    report = _rank.maybe_grow_lora_rank(
         unet=module,
         optimizer=torch.optim.SGD([torch.nn.Parameter(torch.tensor(1.0))], lr=0.1),
-        validation_skeleton=diffusers_backend._ValidationSkeleton(items=()),
-        baseline_report=diffusers_backend._ValidationReport(
+        scheduler=None,
+        validation_skeleton=_validation.ValidationSkeleton(items=()),
+        baseline_report=_validation.ValidationReport(
             step=1,
             loss_mean=1.0,
             loss_max_snr_bucket=1.0,
@@ -1866,6 +1869,11 @@ def test_diffusers_rank_growth_skips_when_memory_is_low(monkeypatch):
         noise_scheduler=None,
         weight_dtype=torch.float32,
         should_probe=True,
+        base_learning_rate=0.1,
+        lora_plus_ratio=1.0,
+        validation_loss_for_item=lambda _item: 1.0,
+        validation_loss_tensor_for_item=lambda _item: torch.tensor(1.0),
+        free_cuda_bytes=1,
     )
 
     assert report["rank_growth_skipped_memory"] is True
@@ -1873,13 +1881,13 @@ def test_diffusers_rank_growth_skips_when_memory_is_low(monkeypatch):
 
 
 def test_diffusers_cache_manifest_records_deterministic_latent_mode(tmp_path):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     latent = tmp_path / "latent.pt"
     hidden = tmp_path / "hidden.pt"
     torch.save(torch.zeros(1), latent)
     torch.save(torch.zeros(1), hidden)
-    record = diffusers_backend._CacheRecord(
+    record = _cache.CacheRecord(
         image="image.png",
         caption_sha256="caption",
         image_sha256="image",
@@ -1890,7 +1898,7 @@ def test_diffusers_cache_manifest_records_deterministic_latent_mode(tmp_path):
     )
     manifest = tmp_path / "manifest.json"
 
-    diffusers_backend._write_cache_manifest(
+    _cache.write_cache_manifest(
         manifest,
         [record],
         latent_scaling_factor=0.18215,
@@ -2172,7 +2180,7 @@ def test_training_no_prepare_requires_valid_prepared_dataset(tmp_path):
     project.datasets.stage("ds", "0001")
     (paths.models / "sd15.safetensors").write_bytes(b"model")
 
-    with pytest.raises(LorakitError, match="Prepared dataset is missing or invalid"):
+    with pytest.raises(LorakitError, match="Prepared dataset directory does not exist"):
         project.train(TrainingSpec(dataset="ds", model="sd15", no_prepare=True))
 
 
@@ -2808,7 +2816,7 @@ def _diffusers_cache_record(
     *,
     latent_shape: tuple[int, int, int],
 ):
-    from lorakit.training.backends import diffusers as diffusers_backend
+    from lorakit.training.backends import _cache
 
     latent_path = root / "latents" / f"{index:08d}.pt"
     hidden_path = root / "text" / f"{index:08d}.pt"
@@ -2816,7 +2824,7 @@ def _diffusers_cache_record(
     hidden_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(torch.zeros(latent_shape), latent_path)
     torch.save(torch.zeros(77, 768), hidden_path)
-    return diffusers_backend._CacheRecord(
+    return _cache.CacheRecord(
         image=f"images/{index:08d}.png",
         caption_sha256=f"caption-{index}",
         image_sha256=f"image-{index}",
