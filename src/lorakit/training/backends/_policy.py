@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 import torch
 from diffusers import DDPMScheduler
@@ -15,10 +16,37 @@ from lorakit.training.backends._validation import (
 )
 
 
+class ObjectiveKind(StrEnum):
+    BASE_MSE = "base_mse"
+    MIN_SNR = "minsnr"
+
+
 @dataclass(frozen=True)
 class ObjectivePolicy:
-    name: str
+    kind: ObjectiveKind
     gamma: float | None = None
+
+    @classmethod
+    def base_mse(cls) -> "ObjectivePolicy":
+        return cls(kind=ObjectiveKind.BASE_MSE)
+
+    @classmethod
+    def min_snr(cls, gamma: float) -> "ObjectivePolicy":
+        if gamma <= 0.0:
+            raise LorakitError(f"Min-SNR gamma must be positive: {gamma}")
+        return cls(kind=ObjectiveKind.MIN_SNR, gamma=float(gamma))
+
+    @property
+    def label(self) -> str:
+        if self.kind == ObjectiveKind.BASE_MSE:
+            return "base_mse"
+        if self.kind == ObjectiveKind.MIN_SNR and self.gamma is not None:
+            return f"minsnr_gamma_{self.gamma:.6g}"
+        raise LorakitError(f"Cannot label objective: {self}")
+
+    @property
+    def is_min_snr(self) -> bool:
+        return self.kind == ObjectiveKind.MIN_SNR
 
 
 @dataclass(frozen=True)
@@ -26,9 +54,13 @@ class TrainingPolicy:
     objective: ObjectivePolicy
     lora_plus_ratio: float
 
+    @classmethod
+    def default(cls) -> "TrainingPolicy":
+        return cls(objective=ObjectivePolicy.base_mse(), lora_plus_ratio=1.0)
+
 
 def default_training_policy() -> TrainingPolicy:
-    return TrainingPolicy(objective=ObjectivePolicy(name="base_mse"), lora_plus_ratio=1.0)
+    return TrainingPolicy.default()
 
 
 def objective_candidates(
@@ -38,16 +70,16 @@ def objective_candidates(
     validation_skeleton: ValidationSkeleton,
     noise_scheduler: DDPMScheduler,
 ) -> list[ObjectivePolicy]:
-    candidates = [ObjectivePolicy(name="base_mse")]
+    candidates = [ObjectivePolicy.base_mse()]
     gammas = [
         validation_bucket_gamma(validation_skeleton=validation_skeleton, bucket="mid"),
         5.0,
         validation_bucket_gamma(
             validation_skeleton=validation_skeleton,
-            bucket=max(baseline_report.loss_by_snr_bucket, key=baseline_report.loss_by_snr_bucket.get),
+            bucket=baseline_report.worst_bucket,
         ),
     ]
-    if current_policy.objective.name == "minsnr" and current_policy.objective.gamma is not None:
+    if current_policy.objective.is_min_snr and current_policy.objective.gamma is not None:
         gammas.append(current_policy.objective.gamma)
     seen: set[float] = set()
     for gamma in gammas:
@@ -55,7 +87,7 @@ def objective_candidates(
         if key in seen:
             continue
         seen.add(key)
-        candidates.append(ObjectivePolicy(name="minsnr", gamma=float(gamma)))
+        candidates.append(ObjectivePolicy.min_snr(float(gamma)))
     return candidates
 
 
@@ -64,14 +96,6 @@ def validation_bucket_gamma(*, validation_skeleton: ValidationSkeleton, bucket: 
     if not values:
         raise LorakitError(f"Validation skeleton has no SNR bucket: {bucket}")
     return float(sum(values) / len(values))
-
-
-def objective_label(objective: ObjectivePolicy) -> str:
-    if objective.name == "base_mse":
-        return "base_mse"
-    if objective.name == "minsnr" and objective.gamma is not None:
-        return f"minsnr_gamma_{objective.gamma:.6g}"
-    raise LorakitError(f"Cannot label objective: {objective}")
 
 
 def ratio_label(ratio: float) -> str:
@@ -135,8 +159,10 @@ def snr_loss_weights(
     noise_scheduler: DDPMScheduler,
     timesteps: torch.Tensor,
 ) -> torch.Tensor:
-    if objective.name != "minsnr" or objective.gamma is None:
+    if not objective.is_min_snr:
         return torch.ones_like(timesteps, dtype=torch.float32)
+    if objective.gamma is None:
+        raise LorakitError("Min-SNR objective requires gamma")
     snr = snr_for_timesteps(noise_scheduler=noise_scheduler, timesteps=timesteps).clamp_min(1e-12)
     gamma = torch.tensor(float(objective.gamma), device=snr.device, dtype=snr.dtype)
     clipped = torch.minimum(snr, gamma)

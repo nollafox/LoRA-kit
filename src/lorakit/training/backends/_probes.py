@@ -37,12 +37,12 @@ from lorakit.training.certified_stepper import (
 
 @dataclass(frozen=True)
 class ProbeConfig:
-    initial_steps: int
-    every_steps: int
-    min_free_cuda_bytes: int
-    window_target_items: int
-    version: int
-    backtrack_factors: tuple[float, ...]
+    initial_steps: int = 3
+    every_steps: int = 25
+    min_free_cuda_bytes: int = 500_000_000
+    window_target_items: int = 4
+    version: int = 5
+    backtrack_factors: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
 
 
 @dataclass(frozen=True)

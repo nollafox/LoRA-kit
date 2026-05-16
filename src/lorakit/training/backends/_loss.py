@@ -8,7 +8,7 @@ import torch
 from diffusers import DDPMScheduler, UNet2DConditionModel
 
 from lorakit.errors import LorakitError
-from lorakit.training.backends._policy import ObjectivePolicy, snr_loss_weights
+from lorakit.training.backends._policy import ObjectiveKind, ObjectivePolicy, snr_loss_weights
 from lorakit.training.certified_stepper import denoising_loss_per_example
 
 
@@ -96,14 +96,14 @@ def objective_loss(
     noise_scheduler: DDPMScheduler,
     objective: ObjectivePolicy,
 ) -> torch.Tensor:
-    if objective.name == "base_mse":
+    if objective.kind == ObjectiveKind.BASE_MSE:
         return per_example_loss.mean()
-    if objective.name == "minsnr":
+    if objective.kind == ObjectiveKind.MIN_SNR:
         if objective.gamma is None:
             raise LorakitError("Min-SNR objective requires gamma")
         weights = snr_loss_weights(objective=objective, noise_scheduler=noise_scheduler, timesteps=timesteps)
         return torch.mean(per_example_loss * weights.to(device=per_example_loss.device, dtype=per_example_loss.dtype))
-    raise LorakitError(f"Unknown training objective: {objective.name}")
+    raise LorakitError(f"Unknown training objective: {objective.kind}")
 
 
 def target(

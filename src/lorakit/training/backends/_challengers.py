@@ -16,14 +16,11 @@ from lorakit.training.backends._policy import (
     lora_plus_candidate_ratios,
     lora_relative_gradient_scales,
     objective_candidates,
-    objective_label,
     ratio_label,
 )
 from lorakit.training.backends._trial import trial_state
 from lorakit.training.backends._validation import (
     ValidationReport,
-    validation_delta_log,
-    validation_score_improves,
 )
 from lorakit.training.certified_stepper import trainable_parameters
 
@@ -80,10 +77,10 @@ class PolicyChallenger:
 
         next_policy = TrainingPolicy(objective=best_objective, lora_plus_ratio=best_ratio)
         return next_policy, {
-            "active_objective": objective_label(current_policy.objective),
+            "active_objective": current_policy.objective.label,
             "objective_candidates": objective_report.logs,
-            "selected_objective": objective_label(best_objective),
-            "objective_switched": objective_label(best_objective) != objective_label(current_policy.objective),
+            "selected_objective": best_objective.label,
+            "objective_switched": best_objective != current_policy.objective,
             "lora_plus": {
                 "active_ratio": float(current_policy.lora_plus_ratio),
                 "candidate_ratios": [float(value) for value in ratio_report.candidates],
@@ -118,12 +115,8 @@ class PolicyChallenger:
                 lora_plus_ratio=current_policy.lora_plus_ratio,
                 baseline_trial=baseline_trial,
             )
-            logs[objective_label(objective)] = validation_delta_log(
-                baseline=baseline,
-                candidate=report,
-                gamma=objective.gamma,
-            )
-            if validation_score_improves(baseline=best_report, candidate=report):
+            logs[objective.label] = report.delta_from(baseline, gamma=objective.gamma)
+            if report.improves(best_report):
                 best_objective = objective
                 best_report = report
         return best_objective, _CandidateReport(logs=logs, best_report=best_report)
@@ -150,11 +143,8 @@ class PolicyChallenger:
                 lora_plus_ratio=ratio,
                 baseline_trial=baseline_trial,
             )
-            logs[ratio_label(ratio)] = validation_delta_log(
-                baseline=baseline,
-                candidate=report,
-            )
-            if validation_score_improves(baseline=best_report, candidate=report):
+            logs[ratio_label(ratio)] = report.delta_from(baseline)
+            if report.improves(best_report):
                 best_ratio = ratio
                 best_report = report
         return best_ratio, _RatioReport(
@@ -199,8 +189,8 @@ class PolicyChallenger:
 
     def _unavailable_report(self, current_policy: TrainingPolicy) -> dict[str, object]:
         return {
-            "active_objective": objective_label(current_policy.objective),
-            "selected_objective": objective_label(current_policy.objective),
+            "active_objective": current_policy.objective.label,
+            "selected_objective": current_policy.objective.label,
             "objective_switched": False,
             "lora_plus": {
                 "active_ratio": float(current_policy.lora_plus_ratio),

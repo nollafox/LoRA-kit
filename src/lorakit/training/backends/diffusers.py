@@ -66,7 +66,6 @@ from lorakit.training.backends._optimizer import (
 )
 from lorakit.training.backends._policy import (
     default_training_policy as _default_training_policy,
-    objective_label as _objective_label,
 )
 from lorakit.training.backends._probes import (
     ContextProber as _ContextProber,
@@ -81,7 +80,6 @@ from lorakit.training.backends._rank import (
 from lorakit.training.backends._validation import (
     BestCheckpoint as _BestCheckpoint,
     build_validation_skeleton as _build_validation_skeleton,
-    select_best_checkpoint as _select_best_checkpoint,
     split_train_validation_records as _split_train_validation_records,
     write_validation_report_if_main as _write_validation_report_if_main,
 )
@@ -98,12 +96,6 @@ VALIDATION_EVERY_PROBES: Final = 1
 
 PROBE_LOG_NAME = "context-probes.jsonl"
 PROBE_SUMMARY_NAME = "context-probes-summary.json"
-PROBE_INITIAL_STEPS: Final = 3
-PROBE_EVERY_STEPS: Final = 25
-PROBE_MIN_FREE_CUDA_BYTES: Final = 500_000_000
-PROBE_WINDOW_TARGET_ITEMS: Final = 4
-PROBE_VERSION: Final = 5
-CERTIFIED_BACKTRACK_FACTORS: Final = (1.0, 0.5, 0.25, 0.125)
 
 
 class _Components:
@@ -234,14 +226,7 @@ def train(spec: BackendSpec) -> BackendResult:
     unet, optimizer, dataloader, scheduler = accelerator.prepare(
         unet, optimizer, dataloader, scheduler
     )
-    probe_config = _ProbeConfig(
-        initial_steps=PROBE_INITIAL_STEPS,
-        every_steps=PROBE_EVERY_STEPS,
-        min_free_cuda_bytes=PROBE_MIN_FREE_CUDA_BYTES,
-        window_target_items=PROBE_WINDOW_TARGET_ITEMS,
-        version=PROBE_VERSION,
-        backtrack_factors=CERTIFIED_BACKTRACK_FACTORS,
-    )
+    probe_config = _ProbeConfig()
     prober = _ContextProber(
         unet=unet,
         optimizer=optimizer,
@@ -309,11 +294,11 @@ def train(spec: BackendSpec) -> BackendResult:
                             else None
                         ),
                         extra={
-                            "probe_version": PROBE_VERSION,
+                            "probe_version": probe_config.version,
                             "microbatch_size": int(loss_context.noise.shape[0]),
                             "requested_batch_size": int(spec.batch_size),
                             "gradient_accumulation": int(spec.gradient_accumulation),
-                            "active_objective": _objective_label(training_policy.objective),
+                            "active_objective": training_policy.objective.label,
                             "active_lora_plus_ratio": float(training_policy.lora_plus_ratio),
                         },
                     )
@@ -342,14 +327,14 @@ def train(spec: BackendSpec) -> BackendResult:
                             status="skipped_cuda_oom",
                             free_cuda_bytes=_cuda_free_bytes(),
                             extra={
-                                "probe_version": PROBE_VERSION,
+                                "probe_version": probe_config.version,
                                 "requested_batch_size": int(spec.batch_size),
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
                         )
                 elif accelerator.sync_gradients and accelerator.is_local_main_process:
                     free_cuda_bytes = _cuda_free_bytes()
-                    if free_cuda_bytes is not None and free_cuda_bytes < PROBE_MIN_FREE_CUDA_BYTES:
+                    if free_cuda_bytes is not None and free_cuda_bytes < probe_config.min_free_cuda_bytes:
                         _write_probe_status_if_main(
                             probe_log_path=probe_log_path,
                             step=global_step,
@@ -357,7 +342,7 @@ def train(spec: BackendSpec) -> BackendResult:
                             status="skipped_low_cuda_memory",
                             free_cuda_bytes=free_cuda_bytes,
                             extra={
-                                "probe_version": PROBE_VERSION,
+                                "probe_version": probe_config.version,
                                 "requested_batch_size": int(spec.batch_size),
                                 "gradient_accumulation": int(spec.gradient_accumulation),
                             },
@@ -379,10 +364,7 @@ def train(spec: BackendSpec) -> BackendResult:
                     validation_probe_count += 1
                     if validation_probe_count % VALIDATION_EVERY_PROBES == 0:
                         validation_report = validator.score(step=global_step)
-                        improved, best_checkpoint = _select_best_checkpoint(
-                            current=best_checkpoint,
-                            report=validation_report,
-                        )
+                        improved, best_checkpoint = best_checkpoint.consider(validation_report)
                         if improved and accelerator.is_main_process:
                             _save_named_lora_weights(
                                 unet=accelerator.unwrap_model(unet),

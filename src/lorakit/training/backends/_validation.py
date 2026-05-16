@@ -50,6 +50,60 @@ class ValidationReport:
     loss_by_snr_bucket: dict[str, float]
     item_count: int
 
+    @property
+    def tolerance(self) -> float:
+        return max(
+            VALIDATION_SCORE_ABSOLUTE_TOLERANCE,
+            VALIDATION_SCORE_RELATIVE_TOLERANCE * max(self.loss_by_snr_bucket.values()),
+        )
+
+    @property
+    def worst_bucket(self) -> str:
+        return max(self.loss_by_snr_bucket, key=self.loss_by_snr_bucket.get)
+
+    def improves(self, baseline: "ValidationReport") -> bool:
+        tolerance = baseline.tolerance
+        if self.loss_max_snr_bucket < baseline.loss_max_snr_bucket - tolerance:
+            return True
+        if self.loss_max_snr_bucket > baseline.loss_max_snr_bucket + tolerance:
+            return False
+        return self.loss_mean < baseline.loss_mean - tolerance
+
+    def nonworse_than(self, baseline: "ValidationReport") -> bool:
+        tolerance = baseline.tolerance
+        if self.loss_max_snr_bucket > baseline.loss_max_snr_bucket + tolerance:
+            return False
+        if self.loss_mean > baseline.loss_mean + tolerance:
+            return False
+        return True
+
+    def delta_from(self, baseline: "ValidationReport", *, gamma: float | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "validation_loss_max_snr_bucket_delta": float(
+                self.loss_max_snr_bucket - baseline.loss_max_snr_bucket
+            ),
+            "validation_loss_mean_delta": float(self.loss_mean - baseline.loss_mean),
+        }
+        if gamma is not None:
+            payload["gamma"] = float(gamma)
+        return payload
+
+    def log_payload(self, *, best_checkpoint: "BestCheckpoint", improved: bool) -> dict[str, object]:
+        return {
+            "step": int(self.step),
+            "probe_status": "validation",
+            "validation_loss_mean": float(self.loss_mean),
+            "validation_loss_max_snr_bucket": float(self.loss_max_snr_bucket),
+            "validation_loss_by_snr_bucket": {
+                bucket: float(loss)
+                for bucket, loss in sorted(self.loss_by_snr_bucket.items())
+            },
+            "validation_item_count": int(self.item_count),
+            "best_checkpoint_improved": bool(improved),
+            "best_checkpoint_step": best_checkpoint.step,
+            "best_checkpoint_path": str(best_checkpoint.path),
+        }
+
 
 @dataclass(frozen=True)
 class BestCheckpoint:
@@ -61,6 +115,25 @@ class BestCheckpoint:
     @classmethod
     def empty(cls, path: Path) -> "BestCheckpoint":
         return cls(path=path, step=None, loss_max_snr_bucket=None, loss_mean=None)
+
+    def consider(self, report: ValidationReport) -> tuple[bool, "BestCheckpoint"]:
+        if self.loss_max_snr_bucket is None or self.loss_mean is None or self.step is None:
+            return True, BestCheckpoint(
+                path=self.path,
+                step=report.step,
+                loss_max_snr_bucket=report.loss_max_snr_bucket,
+                loss_mean=report.loss_mean,
+            )
+        candidate_key = (report.loss_max_snr_bucket, report.loss_mean, report.step)
+        current_key = (self.loss_max_snr_bucket, self.loss_mean, self.step)
+        if candidate_key < current_key:
+            return True, BestCheckpoint(
+                path=self.path,
+                step=report.step,
+                loss_max_snr_bucket=report.loss_max_snr_bucket,
+                loss_mean=report.loss_mean,
+            )
+        return False, self
 
 
 def split_train_validation_records(
@@ -189,65 +262,7 @@ def select_best_checkpoint(
     current: BestCheckpoint,
     report: ValidationReport,
 ) -> tuple[bool, BestCheckpoint]:
-    if current.loss_max_snr_bucket is None or current.loss_mean is None or current.step is None:
-        return True, BestCheckpoint(
-            path=current.path,
-            step=report.step,
-            loss_max_snr_bucket=report.loss_max_snr_bucket,
-            loss_mean=report.loss_mean,
-        )
-    candidate_key = (report.loss_max_snr_bucket, report.loss_mean, report.step)
-    current_key = (current.loss_max_snr_bucket, current.loss_mean, current.step)
-    if candidate_key < current_key:
-        return True, BestCheckpoint(
-            path=current.path,
-            step=report.step,
-            loss_max_snr_bucket=report.loss_max_snr_bucket,
-            loss_mean=report.loss_mean,
-        )
-    return False, current
-
-
-def validation_score_tolerance(report: ValidationReport) -> float:
-    return max(
-        VALIDATION_SCORE_ABSOLUTE_TOLERANCE,
-        VALIDATION_SCORE_RELATIVE_TOLERANCE * max(report.loss_by_snr_bucket.values()),
-    )
-
-
-def validation_score_improves(*, baseline: ValidationReport, candidate: ValidationReport) -> bool:
-    tolerance = validation_score_tolerance(baseline)
-    if candidate.loss_max_snr_bucket < baseline.loss_max_snr_bucket - tolerance:
-        return True
-    if candidate.loss_max_snr_bucket > baseline.loss_max_snr_bucket + tolerance:
-        return False
-    return candidate.loss_mean < baseline.loss_mean - tolerance
-
-
-def validation_score_nonworse(*, baseline: ValidationReport, candidate: ValidationReport) -> bool:
-    tolerance = validation_score_tolerance(baseline)
-    if candidate.loss_max_snr_bucket > baseline.loss_max_snr_bucket + tolerance:
-        return False
-    if candidate.loss_mean > baseline.loss_mean + tolerance:
-        return False
-    return True
-
-
-def validation_delta_log(
-    *,
-    baseline: ValidationReport,
-    candidate: ValidationReport,
-    gamma: float | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "validation_loss_max_snr_bucket_delta": float(
-            candidate.loss_max_snr_bucket - baseline.loss_max_snr_bucket
-        ),
-        "validation_loss_mean_delta": float(candidate.loss_mean - baseline.loss_mean),
-    }
-    if gamma is not None:
-        payload["gamma"] = float(gamma)
-    return payload
+    return current.consider(report)
 
 
 def write_validation_report_if_main(
@@ -260,20 +275,7 @@ def write_validation_report_if_main(
 ) -> None:
     if not should_log:
         return
-    payload = {
-        "step": int(report.step),
-        "probe_status": "validation",
-        "validation_loss_mean": float(report.loss_mean),
-        "validation_loss_max_snr_bucket": float(report.loss_max_snr_bucket),
-        "validation_loss_by_snr_bucket": {
-            bucket: float(loss)
-            for bucket, loss in sorted(report.loss_by_snr_bucket.items())
-        },
-        "validation_item_count": int(report.item_count),
-        "best_checkpoint_improved": bool(improved),
-        "best_checkpoint_step": best_checkpoint.step,
-        "best_checkpoint_path": str(best_checkpoint.path),
-    }
+    payload = report.log_payload(best_checkpoint=best_checkpoint, improved=improved)
     with probe_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True))
         handle.write("\n")

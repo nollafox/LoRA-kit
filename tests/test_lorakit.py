@@ -1595,12 +1595,12 @@ def test_diffusers_snr_weights_match_epsilon_and_v_prediction():
     )
 
     epsilon = _policy.snr_loss_weights(
-        objective=_policy.ObjectivePolicy(name="minsnr", gamma=1.0),
+        objective=_policy.ObjectivePolicy.min_snr(1.0),
         timesteps=timesteps,
         noise_scheduler=EpsilonScheduler(),
     )
     v_prediction = _policy.snr_loss_weights(
-        objective=_policy.ObjectivePolicy(name="minsnr", gamma=1.0),
+        objective=_policy.ObjectivePolicy.min_snr(1.0),
         timesteps=timesteps,
         noise_scheduler=VScheduler(),
     )
@@ -1636,8 +1636,8 @@ def test_diffusers_validation_score_improves_only_beyond_tolerance():
         item_count=3,
     )
 
-    assert not _validation.validation_score_improves(baseline=baseline, candidate=tiny)
-    assert _validation.validation_score_improves(baseline=baseline, candidate=better)
+    assert not tiny.improves(baseline)
+    assert better.improves(baseline)
 
 
 def test_diffusers_objective_switches_only_when_candidate_beats_validation(monkeypatch):
@@ -1669,7 +1669,7 @@ def test_diffusers_objective_switches_only_when_candidate_beats_validation(monke
     def fake_virtual(self, **kwargs):
         del self
         objective = kwargs["objective"]
-        if objective.name == "minsnr":
+        if objective.kind == _policy.ObjectiveKind.MIN_SNR:
             return _validation.ValidationReport(
                 step=1,
                 loss_mean=0.5,
@@ -1695,7 +1695,7 @@ def test_diffusers_objective_switches_only_when_candidate_beats_validation(monke
         baseline=baseline,
     )
 
-    assert policy.objective.name == "minsnr"
+    assert policy.objective.kind == _policy.ObjectiveKind.MIN_SNR
     assert log["objective_switched"] is True
 
 
@@ -1752,7 +1752,7 @@ def test_diffusers_objective_stays_base_when_candidates_do_not_improve(monkeypat
         baseline=baseline,
     )
 
-    assert policy.objective.name == "base_mse"
+    assert policy.objective.kind == _policy.ObjectiveKind.BASE_MSE
     assert log["objective_switched"] is False
 
 

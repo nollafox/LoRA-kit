@@ -24,7 +24,6 @@ from lorakit.training.backends._validation import (
     ValidationReport,
     ValidationSkeleton,
     evaluate_validation_skeleton,
-    validation_score_nonworse,
 )
 
 
@@ -108,7 +107,7 @@ def maybe_grow_lora_rank(
             step=baseline_report.step,
             loss_for_item=validation_loss_for_item,
         )
-        accepted = validation_score_nonworse(baseline=baseline_report, candidate=grown_report)
+        accepted = grown_report.nonworse_than(baseline_report)
         if accepted:
             for _layer, _adapter, trial, _new_named_parameters in grown:
                 trial.commit()
