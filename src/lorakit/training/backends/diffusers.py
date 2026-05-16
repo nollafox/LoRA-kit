@@ -72,7 +72,6 @@ from lorakit.training.backends._probes import (
     GuardrailDecision,
     ProbeConfig,
     default_guardrail_decision,
-    should_probe_contexts,
     write_probe_status_if_main,
 )
 from lorakit.training.backends._rank import maybe_grow_lora_rank
@@ -313,6 +312,9 @@ class _TrainingState:
     validation_probe_count: int
     policy: TrainingPolicy
     best_checkpoint: BestCheckpoint
+    probe_interval_steps: int
+    next_probe_step: int
+    validation_no_improvement_count: int
 
     @classmethod
     def start(cls, *, best_checkpoint_path: Path) -> "_TrainingState":
@@ -321,11 +323,56 @@ class _TrainingState:
             validation_probe_count=0,
             policy=default_training_policy(),
             best_checkpoint=BestCheckpoint.empty(best_checkpoint_path),
+            probe_interval_steps=ProbeConfig().every_steps,
+            next_probe_step=ProbeConfig().every_steps,
+            validation_no_improvement_count=0,
         )
 
     def record_validation_probe(self) -> bool:
         self.validation_probe_count += 1
         return self.validation_probe_count % VALIDATION_EVERY_PROBES == 0
+
+    def probe_is_due(self, *, sync_gradients: bool, config: ProbeConfig) -> bool:
+        if not sync_gradients:
+            return False
+        if self.global_step < config.initial_steps:
+            return True
+        return self.global_step >= self.next_probe_step
+
+    def record_probe_outcome(
+        self,
+        *,
+        improved: bool | None,
+        config: ProbeConfig,
+    ) -> None:
+        # Keep the startup probes dense and then begin the scheduled cadence at
+        # config.every_steps, matching the original 0/1/2/25 behavior.
+        if self.global_step < config.initial_steps:
+            if self.global_step == config.initial_steps - 1:
+                self.probe_interval_steps = int(config.every_steps)
+                self.next_probe_step = int(config.every_steps)
+            return
+
+        if improved is True:
+            self.validation_no_improvement_count = 0
+            self.probe_interval_steps = int(config.every_steps)
+        elif improved is False:
+            self.validation_no_improvement_count += 1
+            self.probe_interval_steps = min(
+                int(config.max_every_steps),
+                int(config.every_steps)
+                + self.validation_no_improvement_count * int(config.backoff_step_increment),
+            )
+        else:
+            # A probe was attempted but no validation decision was available
+            # (for example low memory or skipped update).  Preserve the current
+            # interval but avoid probing every following step.
+            self.probe_interval_steps = min(
+                int(config.max_every_steps),
+                max(int(config.every_steps), int(self.probe_interval_steps)),
+            )
+
+        self.next_probe_step = int(self.global_step + self.probe_interval_steps)
 
 
 @dataclass(frozen=True)
@@ -568,7 +615,7 @@ def _train_batch(
             policy=state.policy,
             guardrail_decision=guardrail_decision,
         )
-        _maybe_validate_and_update_policy(
+        validation_improved = _maybe_validate_and_update_policy(
             runtime=runtime,
             state=state,
             batch=batch,
@@ -576,6 +623,11 @@ def _train_batch(
             should_probe=should_probe,
             committed_update=committed_update,
         )
+        if should_probe:
+            state.record_probe_outcome(
+                improved=validation_improved,
+                config=runtime.probe_config,
+            )
         runtime.optimizer.zero_grad(set_to_none=True)
         return loss
 
@@ -588,23 +640,30 @@ def _probe_update_guardrail(
     current_loss_context: LossContext,
     loss: torch.Tensor,
 ) -> tuple[bool, GuardrailDecision]:
-    should_probe = should_probe_contexts(
-        global_step=state.global_step,
+    free_cuda_bytes = _cuda_free_bytes()
+    probe_due = state.probe_is_due(
         sync_gradients=runtime.accelerator.sync_gradients,
-        free_cuda_bytes=_cuda_free_bytes(),
         config=runtime.probe_config,
     )
-    if should_probe:
-        return True, _run_context_probe(
-            runtime=runtime,
-            state=state,
-            batch=batch,
-            current_loss_context=current_loss_context,
-            loss=loss,
-        )
+    if not probe_due:
+        return False, default_guardrail_decision()
 
-    _write_low_memory_probe_skip_if_needed(runtime=runtime, state=state)
-    return False, default_guardrail_decision()
+    if (
+        free_cuda_bytes is not None
+        and free_cuda_bytes < runtime.probe_config.min_free_cuda_bytes
+        and state.global_step >= runtime.probe_config.initial_steps
+    ):
+        _write_low_memory_probe_skip_if_needed(runtime=runtime, state=state)
+        state.record_probe_outcome(improved=None, config=runtime.probe_config)
+        return False, default_guardrail_decision()
+
+    return True, _run_context_probe(
+        runtime=runtime,
+        state=state,
+        batch=batch,
+        current_loss_context=current_loss_context,
+        loss=loss,
+    )
 
 
 def _run_context_probe(
@@ -743,11 +802,11 @@ def _maybe_validate_and_update_policy(
     current_loss_context: LossContext,
     should_probe: bool,
     committed_update: bool,
-) -> None:
+) -> bool | None:
     if not should_probe or not committed_update or not runtime.workload.validation_skeleton.items:
-        return
+        return None
     if not state.record_validation_probe():
-        return
+        return None
 
     validation_report = runtime.workload.validator.score(step=state.global_step)
     improved, state.best_checkpoint = state.best_checkpoint.consider(validation_report)
@@ -797,12 +856,26 @@ def _maybe_validate_and_update_policy(
         validation_loss_tensor_for_item=runtime.workload.validator.loss_tensor,
         free_cuda_bytes=_cuda_free_bytes(),
     )
+    challenger_log["probe_cadence"] = {
+        "current_interval_steps": int(state.probe_interval_steps),
+        "next_interval_if_improved": int(runtime.probe_config.every_steps),
+        "next_interval_if_no_improvement": int(
+            min(
+                runtime.probe_config.max_every_steps,
+                runtime.probe_config.every_steps
+                + (state.validation_no_improvement_count + 1)
+                * runtime.probe_config.backoff_step_increment,
+            )
+        ),
+        "validation_no_improvement_count": int(state.validation_no_improvement_count),
+    }
     write_policy_challenger_report_if_main(
         probe_log_path=runtime.paths.probe_log_path,
         step=state.global_step,
         payload=challenger_log,
         should_log=runtime.accelerator.is_local_main_process,
     )
+    return bool(improved)
 
 
 def _write_final_lora_weights(*, runtime: _TrainingRuntime) -> None:

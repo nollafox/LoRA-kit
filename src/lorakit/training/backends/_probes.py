@@ -44,6 +44,12 @@ class ProbeConfig:
     version: int = 5
     backtrack_factors: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
 
+    # Adaptive validation/probe cadence.  A probe that improves the best
+    # checkpoint resets cadence to every_steps.  A probe that does not improve
+    # backs off by this increment, capped at max_every_steps.
+    backoff_step_increment: int = 25
+    max_every_steps: int = 250
+
 
 @dataclass(frozen=True)
 class ProbeBatch:

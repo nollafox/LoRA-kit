@@ -50,6 +50,13 @@ RANK_GROWTH_MIN_FREE_CUDA_BYTES: Final = 1_000_000_000
 # to avoid overcommitting memory; the main budget is the MDL channel budget.
 RANK_GROWTH_BYTES_PER_TRAINABLE_PARAMETER: Final = 16
 
+# Distributed residuals can be real: a plateau may require many small rank
+# additions spread across attention layers.  The MDL budget below is therefore
+# not allowed to collapse to a tiny top-k; it has a sublinear distributed floor
+# that grows with both validation evidence and the number of positive residual
+# channels.
+RANK_GROWTH_MIN_DISTRIBUTED_BUDGET: Final = 32
+
 
 @dataclass(frozen=True)
 class RankChannelCandidate:
@@ -220,7 +227,10 @@ def budget_rank_growth_proposals(
     ]
 
     effective_observations = validation_effective_observations(validation_skeleton)
-    mdl_channel_budget = mdl_rank_channel_budget(effective_observations)
+    mdl_channel_budget = mdl_rank_channel_budget(
+        effective_observations,
+        candidate_count=len(candidates),
+    )
     memory_channel_budget = memory_rank_channel_budget(
         candidates=candidates,
         free_cuda_bytes=free_cuda_bytes,
@@ -297,6 +307,13 @@ def budget_rank_growth_proposals(
     budget_report: dict[str, object] = {
         "effective_observations": int(effective_observations),
         "mdl_channel_budget": int(mdl_channel_budget),
+        "mdl_budget_kind": "log_evidence_with_distributed_floor",
+        "mdl_distributed_floor": int(
+            distributed_rank_channel_floor(
+                effective_observations,
+                candidate_count=len(candidates),
+            )
+        ),
         "memory_channel_budget": int(memory_channel_budget),
         "global_channel_budget": int(global_budget),
         "candidate_channel_count": int(len(candidates)),
@@ -338,16 +355,48 @@ def validation_effective_observations(validation_skeleton: ValidationSkeleton) -
     return max(1, int(total))
 
 
-def mdl_rank_channel_budget(effective_observations: int) -> int:
-    """Return a logarithmic structural budget for new rank channels.
+def mdl_rank_channel_budget(
+    effective_observations: int,
+    *,
+    candidate_count: int = 0,
+) -> int:
+    """Return a structural budget for new rank channels.
 
-    A model class should not receive linearly many new structural degrees of
-    freedom from a single plateau event.  The logarithmic budget is the MDL-style
-    part: more validation evidence permits more structural growth, but only
-    sublinearly.
+    The base MDL budget grows logarithmically with effective validation
+    observations.  To handle genuinely distributed residual signal, we also use
+    a sublinear distributed floor:
+
+        sqrt(candidate_count) * log2(log2(n) + 1).
+
+    This is still far below all-modules-per-plateau growth, but it is large
+    enough to cover a delocalized residual when many layers carry positive
+    evidence.  Memory accounting remains the final hard cap.
     """
     n = max(2, int(effective_observations))
-    return max(1, int(math.log2(n)))
+    base_budget = max(1, int(math.log2(n)))
+    return max(
+        base_budget,
+        distributed_rank_channel_floor(
+            effective_observations,
+            candidate_count=candidate_count,
+        ),
+    )
+
+
+def distributed_rank_channel_floor(
+    effective_observations: int,
+    *,
+    candidate_count: int,
+) -> int:
+    if candidate_count <= 0:
+        return 0
+    n = max(2, int(effective_observations))
+    evidence_factor = math.log2(max(2.0, math.log2(n) + 1.0))
+    floor = int(math.ceil(math.sqrt(float(candidate_count)) * evidence_factor))
+    return min(
+        int(candidate_count),
+        max(RANK_GROWTH_MIN_DISTRIBUTED_BUDGET, floor),
+    )
 
 
 def memory_rank_channel_budget(
