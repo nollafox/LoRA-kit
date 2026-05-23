@@ -128,7 +128,7 @@ def build_prompt(
 
 
 def _naturalize_tag(tag: str) -> str:
-    return tag.replace("_", " ")
+    return tag.replace("(", "").replace(")", "").replace("_", " ")
 
 
 def _caption_with_trigger(caption: str, trigger: str) -> str:
@@ -156,8 +156,8 @@ def expand_underscore_tags(tags: list[str]) -> list[str]:
     seen: set[str] = set()
     for tag in tags:
         _append_tag(expanded, seen, tag)
-        if "_" in tag:
-            _append_tag(expanded, seen, tag.replace("_", " "))
+        if "_" in tag or "(" in tag:
+            _append_tag(expanded, seen, _naturalize_tag(tag))
     return expanded
 
 

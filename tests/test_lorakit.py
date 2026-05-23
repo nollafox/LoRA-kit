@@ -846,6 +846,43 @@ def test_prepare_caption_prompt_type_falls_back_to_natural_tags(tmp_path):
     assert read_manifest(prepared / MANIFEST_NAME)[0]["caption"] == "blue eyes"
 
 
+def test_prepare_naturalize_strips_parenthesized_qualifiers(tmp_path):
+    paths = Paths(tmp_path / "data")
+    _candidate(paths, "item", tags=["fox_(species)", "blue_eyes", "looking_at_viewer_(pov)"])
+    project = Project(paths.root)
+    project.datasets.create("ds")
+    project.datasets.stage("ds", "item")
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, prompt_type="natural"),
+    )
+    row = read_manifest(prepared / MANIFEST_NAME)[0]
+    assert row["caption"] == "fox species, blue eyes, looking at viewer pov"
+    assert row["tags"] == ["fox species", "blue eyes", "looking at viewer pov"]
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, prompt_type="tags"),
+    )
+    row = read_manifest(prepared / MANIFEST_NAME)[0]
+    assert row["caption"] == "fox_(species), blue_eyes, looking_at_viewer_(pov)"
+    assert row["tags"] == ["fox_(species)", "blue_eyes", "looking_at_viewer_(pov)"]
+
+    prepared = project.datasets.prepare(
+        "ds",
+        PrepareConfig(width=32, height=32, prompt_type="all"),
+    )
+    row = read_manifest(prepared / MANIFEST_NAME)[0]
+    assert "fox_(species)" in row["caption"]
+    assert "fox species" in row["caption"]
+    assert row["tags"] == [
+        "fox_(species)", "fox species",
+        "blue_eyes", "blue eyes",
+        "looking_at_viewer_(pov)", "looking at viewer pov",
+    ]
+
+
 def test_prepare_flattens_six2one_tag_categories(tmp_path):
     paths = Paths(tmp_path / "data")
     paths.ensure()
