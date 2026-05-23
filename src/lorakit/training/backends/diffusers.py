@@ -510,7 +510,7 @@ def _prepare_training_runtime(
         OptimizerConfig(learning_rate=spec.learning_rate),
     )
     scheduler = get_scheduler(
-        "constant",
+        "cosine",
         optimizer=optimizer,
         num_warmup_steps=LR_WARMUP_STEPS,
         num_training_steps=spec.steps * accelerator.num_processes,
